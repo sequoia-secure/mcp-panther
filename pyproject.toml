@@ -24,11 +24,32 @@ classifiers = [
 ]
 keywords = ["security", "ai", "mcp", "mcp-server", "panther"]
 dependencies = [
-    "aiohttp>=3.11.14,<4.0.0",
+    # Direct deps — bumped to close CVEs in our own surface.
+    "aiohttp>=3.13.4,<4.0.0",   # 18 CVE fixes in 3.11.x → 3.13.x line
     "gql>=3.5.2,<4.0.0",
     "click>=8.1.0,<9.0.0",
-    "fastmcp~=2.14.0",
-    "sqlparse>=0.4.4,<1.0.0"
+    "fastmcp>=2.14.7,<3.0.0",   # latest of the 2.14.x line; CVE-2025-69196 (MCP protocol parser)
+                                # Three further fastmcp CVEs (one CRITICAL OpenAPI provider SSRF,
+                                # one HIGH OAuth confused-deputy, one MED command injection)
+                                # require fastmcp 3.x. Deferred — none are reachable in our stdio
+                                # deployment (we don't expose the OpenAPI provider or OAuth flows;
+                                # the proxy handles auth at the boundary).
+    "sqlparse>=0.5.4,<1.0.0",   # GHSA-27jp-wm6q-gp25 DoS via deep SQL parsing
+
+    # Transitive pins to close CVEs in deps inherited through fastmcp's loose
+    # constraints. Listing these as direct deps forces uv's resolver to pick
+    # versions with known fixes. Reviewed against
+    # https://github.com/sequoia-secure/mcp-panther/security/dependabot.
+    "authlib>=1.7.1",            # CRITICAL JWS JWK header injection + 5 others
+    "cryptography>=46.0.7",      # HIGH subgroup attack + 2 others
+    "urllib3>=2.7.0",            # 2 HIGH (decompression bombs, header forwarding) + 1 MED
+    "pyjwt>=2.12.0",             # HIGH `crit` header bypass
+    "requests>=2.33.0",          # MED insecure temp-file reuse
+    "python-multipart>=0.0.27",  # HIGH arbitrary file write + 2 DoS (HTTP transport only)
+    "starlette>=0.49.1",         # HIGH Range-header O(n²) DoS (HTTP transport only)
+    "python-dotenv>=1.2.2",      # MED symlink overwrite in set_key
+    "pygments>=2.20.0",          # LOW ReDoS
+    "jaraco-context>=6.1.0",     # CVE-2026-23949 (transitive via keyring)
 ]
 
 [project.urls]
@@ -38,7 +59,7 @@ Repository = "https://github.com/panther-labs/mcp-panther.git"
 [dependency-groups]
 dev = [
     "ruff>=0.11.2",
-    "pytest>=8.0.0",
+    "pytest>=9.0.3",            # GHSA-6w46-j5rx-g56g tmpdir handling
     "pytest-asyncio>=0.23.5",
     "pytest-cov>=4.1.0",
     "pytest-env>=1.1.1",

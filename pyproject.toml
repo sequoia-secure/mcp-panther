@@ -28,7 +28,7 @@ dependencies = [
     "aiohttp>=3.13.4,<4.0.0",   # 18 CVE fixes in 3.11.x → 3.13.x line
     "gql>=3.5.2,<4.0.0",
     "click>=8.1.0,<9.0.0",
-    "fastmcp>=2.14.7,<3.0.0",   # latest of the 2.14.x line; CVE-2025-69196 (MCP protocol parser)
+    "fastmcp>=2.14.7,<4.0.0",   # latest of the 2.14.x line; CVE-2025-69196 (MCP protocol parser)
                                 # Three further fastmcp CVEs (one CRITICAL OpenAPI provider SSRF,
                                 # one HIGH OAuth confused-deputy, one MED command injection)
                                 # require fastmcp 3.x. Deferred — none are reachable in our stdio

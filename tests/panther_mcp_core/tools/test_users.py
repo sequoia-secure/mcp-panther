@@ -96,3 +96,35 @@ async def test_list_users_structure():
     assert "limit" in params
     assert sig.parameters["cursor"].default is None
     assert sig.parameters["limit"].default == 60
+
+
+@pytest.mark.asyncio
+@patch_rest_client(USERS_MODULE_PATH)
+async def test_get_user_rejects_path_injection(mock_rest_client):
+    """An injected ID cannot retarget the request at another REST endpoint."""
+    malicious_ids = [
+        "../api-tokens/self",
+        "..%2fapi-tokens",
+        "user-123?limit=1#",
+        "user-123/../../api-tokens/self",
+        "..",
+    ]
+
+    for malicious_id in malicious_ids:
+        mock_rest_client.get.reset_mock()
+        mock_rest_client.get.return_value = (MOCK_USER, 200)
+
+        result = await get_user(malicious_id)
+
+        if not mock_rest_client.get.called:
+            # Rejected before any request was made.
+            assert result["success"] is False
+            continue
+
+        # Otherwise the ID stayed a single opaque segment under /users.
+        path = mock_rest_client.get.call_args[0][0]
+        assert path.startswith("/users/")
+        assert path.count("/") == 2
+        assert "?" not in path
+        assert "#" not in path
+        assert ".." not in path.split("/")

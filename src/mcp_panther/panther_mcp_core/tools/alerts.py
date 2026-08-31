@@ -11,6 +11,7 @@ from pydantic import BeforeValidator, Field
 from ..client import (
     _execute_query,
     _get_week_date_range,
+    encode_path_segment,
     get_rest_client,
 )
 from ..permissions import Permission, all_perms
@@ -339,7 +340,8 @@ async def get_alert(
         # Execute the REST API call
         async with get_rest_client() as client:
             alert_data, status = await client.get(
-                f"/alerts/{alert_id}", expected_codes=[200, 400, 404]
+                f"/alerts/{encode_path_segment(alert_id)}",
+                expected_codes=[200, 400, 404],
             )
 
         if status == 404:
@@ -687,7 +689,9 @@ async def get_alert_events(
 
         async with get_rest_client() as client:
             result, status = await client.get(
-                f"/alerts/{alert_id}/events", params=params, expected_codes=[200, 404]
+                f"/alerts/{encode_path_segment(alert_id)}/events",
+                params=params,
+                expected_codes=[200, 404],
             )
 
             if status == 404:

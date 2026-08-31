@@ -5,12 +5,15 @@ import pytest
 from aiohttp import ClientResponse
 
 from mcp_panther.panther_mcp_core.client import (
+    PantherRestClient,
     UnexpectedResponseStatusError,
     _get_user_agent,
     _is_running_in_docker,
+    encode_path_segment,
     get_instance_config,
     get_json_from_script_tag,
     get_panther_rest_api_base,
+    validate_rest_path,
 )
 
 
@@ -191,3 +194,101 @@ async def test_get_panther_rest_api_base():
     ):
         base = await get_panther_rest_api_base()
         assert base == ""
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("user-123", "user-123"),
+        ("AWS.Suspicious.S3.Activity", "AWS.Suspicious.S3.Activity"),
+        (
+            "6c6574cb-fbf9-49fc-baad-1a99464ef09e",
+            "6c6574cb-fbf9-49fc-baad-1a99464ef09e",
+        ),
+        # Query/fragment delimiters must not survive as structural characters.
+        ("x?limit=1", "x%3Flimit%3D1"),
+        ("x#frag", "x%23frag"),
+        # An already percent-encoded separator must not be handed through as-is.
+        ("..%2fapi-tokens", "..%252fapi-tokens"),
+        ("john.doe@company.com", "john.doe%40company.com"),
+    ],
+)
+def test_encode_path_segment(value, expected):
+    """IDs are encoded into exactly one opaque path segment."""
+    assert encode_path_segment(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        ".",
+        "..",
+        "%2e",
+        "%2e%2e",
+        "%2E%2e",
+        ".%2e",
+        "../api-tokens/self",
+        "a/b",
+        "..\\api-tokens",
+    ],
+)
+def test_encode_path_segment_rejects_traversal(value):
+    """Empty IDs, path separators and relative references are rejected."""
+    with pytest.raises(ValueError):
+        encode_path_segment(value)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/users",
+        "/users/user-123",
+        "/users/..%252fapi-tokens",
+        "/log-sources/http/http-source-123",
+        "/rules/AWS.Suspicious.S3.Activity",
+    ],
+)
+def test_validate_rest_path_allows_safe_paths(path):
+    """Curated endpoints and encoded IDs pass through unchanged."""
+    assert validate_rest_path(path) == path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/users/../api-tokens/self",
+        "/users/..",
+        "/users/%2e%2e/api-tokens",
+        "/users/./api-tokens",
+        "/users/x?limit=1",
+        "/users/x#frag",
+        "//evil.example.com/users",
+        "https://evil.example.com/users",
+        "/users/..\\api-tokens",
+        # Percent-encoded separators, which a server may decode back into a
+        # traversal.
+        "/users/%2e%2e%2fapi-tokens",
+        "/users/%2E%2E%2Fapi-tokens",
+        "/users/..%2fapi-tokens",
+    ],
+)
+def test_validate_rest_path_rejects_retargeting_paths(path):
+    """Traversal, query strings and fragments cannot retarget a request."""
+    with pytest.raises(ValueError):
+        validate_rest_path(path)
+
+
+def test_build_url_rejects_traversal():
+    """_build_url is the shared last line of defense for unencoded callers."""
+    client = PantherRestClient()
+    client._base_url = "https://example.panther.io/v1"
+
+    assert (
+        client._build_url("/users/user-123")
+        == "https://example.panther.io/v1/users/user-123"
+    )
+
+    with pytest.raises(ValueError):
+        client._build_url("/users/../api-tokens/self")

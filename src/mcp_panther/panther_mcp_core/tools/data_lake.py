@@ -29,6 +29,54 @@ logger = logging.getLogger("mcp-panther")
 INITIAL_QUERY_SLEEP_SECONDS = 1
 MAX_QUERY_SLEEP_SECONDS = 5
 
+# Upper bound on the SQL we are willing to validate and forward. Real queries
+# are orders of magnitude smaller; the cap keeps the work done on untrusted
+# input bounded before the validation scans below run over it.
+MAX_SQL_LENGTH = 100_000
+
+# Time filter validation patterns, compiled once at import time.
+#
+# These patterns deliberately avoid overlapping/nested quantifiers so that
+# matching stays linear in the length of the query. The previous single pattern
+# bridged `WHERE`/`AND` and `p_event_time` with a lazy `.*?` followed by an
+# optional `(?:[\w.]+\.)?` qualifier; the two quantifiers matched the same
+# characters, so non-matching input caused super-linear backtracking (ReDoS)
+# that blocked the server's event loop.
+#
+# The equivalent check is split in two linear steps instead: find the first
+# `WHERE`/`AND` keyword, then look for a `p_event_time` comparison after it. Any
+# table qualifier (e.g. `t.p_event_time`) is simply part of the text skipped
+# between the two, exactly as the lazy bridge allowed.
+_WHERE_OR_AND_PATTERN = re.compile(r"\b(?:where|and)\s")
+_P_EVENT_TIME_FILTER_PATTERN = re.compile(r"p_event_time\s*(?:>=|<=|=|>|<|between)")
+_PANTHER_MACRO_PATTERN = re.compile(
+    r"p_occurs_(?:since|between|around|after|before)\s*\("
+)
+_PANTHER_DATABASE_PATTERN = re.compile(
+    r"\Wpanther_(?:views|signals|rule_matches|rule_errors|monitor|logs|cloudsecurity)\."
+)
+
+
+def _has_p_event_time_filter(sql_lower: str) -> bool:
+    """
+    Check for a `p_event_time` comparison in a filter position.
+
+    Args:
+        sql_lower: The lowercased query, with newlines already collapsed.
+
+    Returns:
+        True if a `p_event_time` comparison appears after a `WHERE`/`AND`
+        keyword, optionally table-qualified.
+    """
+    # The first WHERE/AND gives the earliest position a filter can start at, so
+    # searching from it is equivalent to trying every WHERE/AND keyword.
+    where_or_and = _WHERE_OR_AND_PATTERN.search(sql_lower)
+    if where_or_and is None:
+        return False
+
+    match = _P_EVENT_TIME_FILTER_PATTERN.search(sql_lower, where_or_and.end())
+    return match is not None
+
 
 # Characters an ISO-8601 timestamp can legitimately contain. datetime.fromisoformat()
 # accepts any single character as the date/time separator (e.g. "2024-01-01'00:00:00"),
@@ -208,7 +256,8 @@ async def query_data_lake(
     sql: Annotated[
         str,
         Field(
-            description="The SQL query to execute. Must include a p_event_time filter condition after WHERE or AND. The query must be compatible with Snowflake SQL."
+            description="The SQL query to execute. Must include a p_event_time filter condition after WHERE or AND. The query must be compatible with Snowflake SQL.",
+            max_length=MAX_SQL_LENGTH,
         ),
     ],
     database_name: str = "panther_logs.public",
@@ -292,21 +341,26 @@ async def query_data_lake(
 
     start_time = time.time()
 
+    # Reject oversized queries before doing any validation work
+    if len(sql) > MAX_SQL_LENGTH:
+        error_msg = (
+            f"Query is too long ({len(sql)} characters). "
+            f"The maximum supported length is {MAX_SQL_LENGTH} characters."
+        )
+        logger.error(error_msg)
+        return {
+            "success": False,
+            "message": error_msg,
+            "query_id": None,
+        }
+
     # Validate that the query includes a time filter (p_event_time or Panther macros)
     sql_lower = sql.lower().replace("\n", " ")
-    has_p_event_time = re.search(
-        r"\b(where|and)\s+.*?(?:[\w.]+\.)?p_event_time\s*(>=|<=|=|>|<|between)",
-        sql_lower,
-    )
-    has_panther_macros = re.search(
-        r"p_occurs_(since|between|around|after|before)\s*\(",
-        sql_lower,
-    )
+    has_p_event_time = _has_p_event_time_filter(sql_lower)
+    has_panther_macros = _PANTHER_MACRO_PATTERN.search(sql_lower)
+    has_time_filter = has_p_event_time or has_panther_macros
 
-    if (not (has_p_event_time or has_panther_macros)) and re.search(
-        r"\Wpanther_(views|signals|rule_matches|rule_errors|monitor|logs|cloudsecurity)\.",
-        sql_lower,
-    ):
+    if not has_time_filter and _PANTHER_DATABASE_PATTERN.search(sql_lower):
         error_msg = "Query must include a time filter: either `p_event_time` condition or Panther macro (p_occurs_since, p_occurs_between, etc.)"
         logger.error(error_msg)
         return {

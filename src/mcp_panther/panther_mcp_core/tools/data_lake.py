@@ -9,8 +9,7 @@ import time
 from enum import Enum
 from typing import Annotated, Any, Dict, List
 
-import sqlparse
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from ..client import _execute_query, _get_today_date_range
 from ..permissions import Permission, all_perms
@@ -22,6 +21,7 @@ from ..queries import (
     LIST_DATABASES_QUERY,
     LIST_TABLES_QUERY,
 )
+from ..validators import _validate_alert_ids, _validate_iso_date
 from .registry import mcp_tool
 
 logger = logging.getLogger("mcp-panther")
@@ -30,104 +30,32 @@ INITIAL_QUERY_SLEEP_SECONDS = 1
 MAX_QUERY_SLEEP_SECONDS = 5
 
 
-# Snowflake reserved words that should be quoted when used as identifiers
-SNOWFLAKE_RESERVED_WORDS = {
-    "SELECT",
-    "FROM",
-    "WHERE",
-    "JOIN",
-    "LEFT",
-    "RIGHT",
-    "INNER",
-    "OUTER",
-    "ON",
-    "AS",
-    "ORDER",
-    "GROUP",
-    "BY",
-    "HAVING",
-    "UNION",
-    "ALL",
-    "DISTINCT",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "CREATE",
-    "ALTER",
-    "DROP",
-    "TABLE",
-    "VIEW",
-    "INDEX",
-    "COLUMN",
-    "PRIMARY",
-    "KEY",
-    "FOREIGN",
-    "UNIQUE",
-    "NOT",
-    "NULL",
-    "DEFAULT",
-    "CHECK",
-    "CONSTRAINT",
-    "REFERENCES",
-    "CASCADE",
-    "RESTRICT",
-    "SET",
-    "VALUES",
-    "INTO",
-    "CASE",
-    "WHEN",
-    "THEN",
-    "ELSE",
-    "END",
-    "IF",
-    "EXISTS",
-    "LIKE",
-    "BETWEEN",
-    "IN",
-    "IS",
-    "AND",
-    "OR",
-    "WITH",
-}
+# Characters an ISO-8601 timestamp can legitimately contain. datetime.fromisoformat()
+# accepts any single character as the date/time separator (e.g. "2024-01-01'00:00:00"),
+# so dates are additionally checked against this set before reaching a SQL literal.
+_SQL_DATE_CHARS = re.compile(r"[0-9A-Za-z:+. -]+")
 
 
-def wrap_reserved_words(sql: str) -> str:
+def _sql_string_literal(value: str) -> str:
+    """Render a value as a single-quoted Snowflake SQL string literal.
+
+    Callers must still validate the value against the format they expect; the
+    escaping here is defense in depth so a stray quote or backslash can never
+    terminate the literal and turn data into query structure.
     """
-    Simple function to wrap reserved words in SQL using sqlparse.
+    escaped = value.replace("\\", "\\\\").replace("'", "''")
+    return f"'{escaped}'"
 
-    This function:
-    1. Parses the SQL using sqlparse
-    2. Identifies string literals that match reserved words
-    3. Converts single-quoted reserved words to double-quoted ones
 
-    Args:
-        sql: The SQL query string to process
-
-    Returns:
-        The SQL with reserved words properly quoted
-    """
-    try:
-        # Parse the SQL
-        parsed = sqlparse.parse(sql)[0]
-
-        # Convert the parsed SQL back to string, but process tokens
-        result = []
-        for token in parsed.flatten():
-            if token.ttype is sqlparse.tokens.Literal.String.Single:
-                # Remove quotes and check if it's a reserved word
-                value = token.value.strip("'")
-                if value.upper() in SNOWFLAKE_RESERVED_WORDS:
-                    # Convert to double-quoted identifier
-                    result.append(f'"{value}"')
-                else:
-                    result.append(token.value)
-            else:
-                result.append(token.value)
-
-        return "".join(result)
-    except Exception as e:
-        logger.warning(f"Failed to parse SQL for reserved words: {e}")
-        return sql
+def _validate_sql_date(value: str | None) -> str | None:
+    """Validate a date that will be interpolated into a SQL string literal."""
+    value = _validate_iso_date(value)
+    if value is not None and not _SQL_DATE_CHARS.fullmatch(value):
+        raise ValueError(
+            f"Invalid date format '{value}'. Must be in ISO-8601 format "
+            "(e.g., '2024-03-20T00:00:00Z')"
+        )
+    return value
 
 
 class QueryStatus(str, Enum):
@@ -148,9 +76,11 @@ class QueryStatus(str, Enum):
 async def get_alert_event_stats(
     alert_ids: Annotated[
         List[str],
+        BeforeValidator(_validate_alert_ids),
         Field(
             description="List of alert IDs to analyze",
             examples=[["alert-123", "alert-456", "alert-789"]],
+            min_length=1,
         ),
     ],
     time_window: Annotated[
@@ -164,6 +94,7 @@ async def get_alert_event_stats(
     ] = 30,
     start_date: Annotated[
         str | None,
+        BeforeValidator(_validate_sql_date),
         Field(
             description="Optional start date in ISO-8601 format. Defaults to start of today UTC.",
             examples=["2024-03-20T00:00:00Z"],
@@ -171,6 +102,7 @@ async def get_alert_event_stats(
     ] = None,
     end_date: Annotated[
         str | None,
+        BeforeValidator(_validate_sql_date),
         Field(
             description="Optional end date in ISO-8601 format. Defaults to end of today UTC.",
             examples=["2024-03-20T00:00:00Z"],
@@ -199,18 +131,28 @@ async def get_alert_event_stats(
     if time_window not in [1, 5, 15, 30, 60]:
         raise ValueError("Time window must be 1, 5, 15, 30, or 60")
 
+    # Re-validate the values that get interpolated into SQL below. The parameter
+    # annotations already validate them for MCP callers; repeating it here keeps the
+    # query safe when the coroutine is called directly.
+    alert_ids = _validate_alert_ids(alert_ids)
+    if not alert_ids:
+        raise ValueError("At least one alert ID must be provided")
+
+    start_date = _validate_sql_date(start_date)
+    end_date = _validate_sql_date(end_date)
+
     # Get default date range if not provided
     if not start_date or not end_date:
         default_start, default_end = _get_today_date_range()
         start_date = start_date or default_start
         end_date = end_date or default_end
 
-    # Convert alert IDs list to SQL array
-    alert_ids_str = ", ".join(f"'{aid}'" for aid in alert_ids)
+    # Convert alert IDs list to a SQL list of quoted literals
+    alert_ids_str = ", ".join(_sql_string_literal(aid) for aid in alert_ids)
 
-    # Use the date strings directly (already in GraphQL format)
-    start_date_str = start_date
-    end_date_str = end_date
+    # Quote the dates as literals (already validated as ISO-8601)
+    start_date_str = _sql_string_literal(start_date)
+    end_date_str = _sql_string_literal(end_date)
 
     query = f"""
 SELECT
@@ -233,7 +175,7 @@ FROM
 WHERE
     cs.p_alert_id IN ({alert_ids_str})
 AND 
-    cs.p_event_time BETWEEN '{start_date_str}' AND '{end_date_str}'
+    cs.p_event_time BETWEEN {start_date_str} AND {end_date_str}
 GROUP BY
     event_day,
     time_{time_window}_minute,
@@ -328,6 +270,8 @@ async def query_data_lake(
     - Access nested JSON: column:field.subfield
     - Quote special characters: column:"field name" or p_enrichment:"context.ip_address"
     - Array searches: ARRAY_CONTAINS('value'::VARIANT, array_column)
+    - Single quotes are always string literals; use double quotes for identifiers and
+      aliases that collide with reserved words: SELECT eventName AS "select"
 
     Returns:
         Dict with query results:
@@ -368,13 +312,13 @@ async def query_data_lake(
         }
 
     try:
-        # Process reserved words in the SQL
-        processed_sql = wrap_reserved_words(sql)
-        logger.debug(f"Original SQL: {sql}")
-        logger.debug(f"Processed SQL: {processed_sql}")
+        # The SQL is sent verbatim: rewriting tokens here (for example promoting a
+        # quoted literal to an identifier) would change the meaning of the caller's
+        # query and could turn data into query structure.
+        logger.debug(f"SQL: {sql}")
 
         # Prepare input variables
-        variables = {"input": {"sql": processed_sql, "databaseName": database_name}}
+        variables = {"input": {"sql": sql, "databaseName": database_name}}
 
         logger.debug(f"Query variables: {variables}")
 

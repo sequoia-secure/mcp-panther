@@ -614,7 +614,7 @@ class PantherRestClient:
             ValueError: If the path could retarget the request at a different
                 endpoint (see :func:`validate_rest_path`)
         """
-        validate_rest_path(path)
+        path = validate_rest_path(path)
 
         # Remove leading slash if present to avoid double slashes
         if path.startswith("/"):

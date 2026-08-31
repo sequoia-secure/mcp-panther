@@ -8,6 +8,10 @@ multiple tool modules to ensure consistent parameter validation.
 import re
 from datetime import datetime
 
+# Panther alert IDs are opaque identifiers: 32-character hex, or short
+# alphanumeric labels such as "alert-123".
+_ALERT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
 
 def _validate_severities(v: list[str]) -> list[str]:
     """Validate severities are valid."""
@@ -86,6 +90,24 @@ def _validate_rule_ids(v: list[str]) -> list[str]:
         if problematic_chars.search(rule_id):
             raise ValueError(
                 f"Invalid rule ID '{rule_id}'. Rule IDs cannot contain '@', spaces, or '#' characters"
+            )
+    return v
+
+
+def _validate_alert_ids(v: list[str]) -> list[str]:
+    """Validate alert IDs contain only characters legal in a Panther alert ID.
+
+    Alert IDs are interpolated into data lake SQL, and that API accepts only
+    raw SQL text - there are no bind parameters - so they are restricted to an
+    allowlist rather than escaped. Panther alert IDs are opaque identifiers
+    (32-character hex, or short alphanumeric labels), so nothing legitimate is
+    lost by refusing everything else.
+    """
+    for alert_id in v:
+        if not isinstance(alert_id, str) or not _ALERT_ID_PATTERN.fullmatch(alert_id):
+            raise ValueError(
+                f"Invalid alert ID '{alert_id}'. Alert IDs may contain only "
+                f"letters, digits, hyphens and underscores"
             )
     return v
 

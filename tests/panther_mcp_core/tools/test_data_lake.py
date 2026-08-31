@@ -4,6 +4,8 @@ import pytest
 
 from mcp_panther.panther_mcp_core.tools.data_lake import (
     _cancel_data_lake_query,
+    _sql_string_literal,
+    get_alert_event_stats,
     query_data_lake,
     wrap_reserved_words,
 )
@@ -620,3 +622,97 @@ async def test_query_data_lake_max_rows_parameter_limits(
         mock_results.assert_called_with(
             query_id=MOCK_QUERY_ID, max_rows=25, cursor="test_cursor"
         )
+
+
+SQL_INJECTION_PAYLOADS = [
+    "x' OR '1'='1",
+    "x') OR 1=1--",
+    "x'; DROP TABLE panther_signals.public.correlation_signals;--",
+    "x' UNION SELECT password FROM secrets--",
+    "x\\",
+    "x'/*",
+    'x" OR "1"="1',
+]
+
+
+async def _captured_stats_sql(alert_ids, start_date=None, end_date=None):
+    """Run get_alert_event_stats and return the SQL it builds."""
+    captured = {}
+
+    async def fake_query_data_lake(sql, database_name, max_rows=100):
+        captured["sql"] = sql
+        return {"success": True, "results": []}
+
+    with patch(f"{DATA_LAKE_MODULE_PATH}.query_data_lake", fake_query_data_lake):
+        await get_alert_event_stats(alert_ids, 30, start_date, end_date)
+
+    return captured["sql"]
+
+
+@pytest.mark.asyncio
+async def test_get_alert_event_stats_builds_expected_sql():
+    """A legitimate call still produces the intended literals."""
+    sql = await _captured_stats_sql(
+        ["df1eb66cede030f1a6d29362ba437178", "alert-123"],
+        "2024-03-20T00:00:00.000Z",
+        "2024-03-21T00:00:00.000Z",
+    )
+
+    assert "cs.p_alert_id IN ('df1eb66cede030f1a6d29362ba437178', 'alert-123')" in sql
+    assert "BETWEEN '2024-03-20T00:00:00.000Z' AND '2024-03-21T00:00:00.000Z'" in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", SQL_INJECTION_PAYLOADS)
+async def test_get_alert_event_stats_rejects_alert_id_injection(payload):
+    """An injected alert ID never reaches the generated SQL.
+
+    The data lake API takes raw SQL with no bind parameters, so alert IDs are
+    restricted to their legal character set instead of being escaped.
+    """
+    with pytest.raises(ValueError):
+        await _captured_stats_sql([payload])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "2024-03-20T00:00:00Z' OR '1'='1",
+        "' UNION SELECT 1--",
+        "2024-01-01'; DROP TABLE x;--",
+        "not-a-date",
+    ],
+)
+async def test_get_alert_event_stats_rejects_date_injection(payload):
+    """An injected date never reaches the generated SQL."""
+    with pytest.raises(ValueError):
+        await _captured_stats_sql(["alert-1"], payload, "2024-03-21T00:00:00Z")
+
+    with pytest.raises(ValueError):
+        await _captured_stats_sql(["alert-1"], "2024-03-20T00:00:00Z", payload)
+
+
+@pytest.mark.asyncio
+async def test_get_alert_event_stats_requires_alert_ids():
+    """An empty alert ID list cannot produce an empty IN () clause."""
+    with pytest.raises(ValueError):
+        await _captured_stats_sql([])
+
+
+@pytest.mark.parametrize(
+    "value", ["alert-123", "df1eb66cede030f1a6d29362ba437178", "a_b-C9"]
+)
+def test_sql_string_literal_quotes_safe_values(value):
+    """Validated values are rendered as single-quoted literals."""
+    assert _sql_string_literal(value) == f"'{value}'"
+
+
+@pytest.mark.parametrize("value", SQL_INJECTION_PAYLOADS + ["a;b", "a--b", 123])
+def test_sql_string_literal_refuses_unsafe_values(value):
+    """The sink refuses quotes, backslashes and comment markers.
+
+    This is the backstop for a caller that skips parameter validation.
+    """
+    with pytest.raises(ValueError):
+        _sql_string_literal(value)

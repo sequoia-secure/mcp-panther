@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Annotated, Any, Dict, List
 
 import sqlparse
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from ..client import _execute_query, _get_today_date_range
 from ..permissions import Permission, all_perms
@@ -22,6 +22,7 @@ from ..queries import (
     LIST_DATABASES_QUERY,
     LIST_TABLES_QUERY,
 )
+from ..validators import _validate_alert_ids, _validate_iso_date
 from .registry import mcp_tool
 
 logger = logging.getLogger("mcp-panther")
@@ -91,6 +92,34 @@ SNOWFLAKE_RESERVED_WORDS = {
 }
 
 
+# Characters that let a value escape the string literal it is embedded in, or
+# comment out the rest of the statement. Snowflake treats backslash as an
+# escape character inside string literals, so a trailing one would consume the
+# closing quote.
+_UNSAFE_LITERAL_PATTERN = re.compile(r"['\"\\;]|--|/\*")
+
+
+def _sql_string_literal(value: str) -> str:
+    """Render an already-validated value as a single-quoted SQL literal.
+
+    The data lake API accepts only raw SQL text - it exposes no bind
+    parameters - so every interpolated value is an injection sink. Callers are
+    expected to validate against an allowlist first; this is the backstop that
+    refuses anything still carrying a quote, backslash or comment marker, so a
+    validation that is missed or later removed cannot silently become an
+    injection.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"Expected a string SQL value, got {type(value).__name__}")
+
+    if _UNSAFE_LITERAL_PATTERN.search(value):
+        raise ValueError(
+            f"Refusing to build a SQL literal from unsafe value: {value!r}"
+        )
+
+    return f"'{value}'"
+
+
 def wrap_reserved_words(sql: str) -> str:
     """
     Simple function to wrap reserved words in SQL using sqlparse.
@@ -148,6 +177,7 @@ class QueryStatus(str, Enum):
 async def get_alert_event_stats(
     alert_ids: Annotated[
         List[str],
+        BeforeValidator(_validate_alert_ids),
         Field(
             description="List of alert IDs to analyze",
             examples=[["alert-123", "alert-456", "alert-789"]],
@@ -164,6 +194,7 @@ async def get_alert_event_stats(
     ] = 30,
     start_date: Annotated[
         str | None,
+        BeforeValidator(_validate_iso_date),
         Field(
             description="Optional start date in ISO-8601 format. Defaults to start of today UTC.",
             examples=["2024-03-20T00:00:00Z"],
@@ -171,6 +202,7 @@ async def get_alert_event_stats(
     ] = None,
     end_date: Annotated[
         str | None,
+        BeforeValidator(_validate_iso_date),
         Field(
             description="Optional end date in ISO-8601 format. Defaults to end of today UTC.",
             examples=["2024-03-20T00:00:00Z"],
@@ -199,18 +231,28 @@ async def get_alert_event_stats(
     if time_window not in [1, 5, 15, 30, 60]:
         raise ValueError("Time window must be 1, 5, 15, 30, or 60")
 
+    # Re-validate here rather than relying on the BeforeValidator annotations
+    # alone: those run only when FastMCP validates the call, so a direct call
+    # would otherwise reach the SQL below unchecked.
+    if not alert_ids:
+        raise ValueError("At least one alert ID must be provided")
+    _validate_alert_ids(alert_ids)
+
     # Get default date range if not provided
     if not start_date or not end_date:
         default_start, default_end = _get_today_date_range()
         start_date = start_date or default_start
         end_date = end_date or default_end
 
-    # Convert alert IDs list to SQL array
-    alert_ids_str = ", ".join(f"'{aid}'" for aid in alert_ids)
+    _validate_iso_date(start_date)
+    _validate_iso_date(end_date)
 
-    # Use the date strings directly (already in GraphQL format)
-    start_date_str = start_date
-    end_date_str = end_date
+    # Convert alert IDs list to SQL array
+    alert_ids_str = ", ".join(_sql_string_literal(aid) for aid in alert_ids)
+
+    # The date strings are already in GraphQL format
+    start_date_str = _sql_string_literal(start_date)
+    end_date_str = _sql_string_literal(end_date)
 
     query = f"""
 SELECT
@@ -233,7 +275,7 @@ FROM
 WHERE
     cs.p_alert_id IN ({alert_ids_str})
 AND 
-    cs.p_event_time BETWEEN '{start_date_str}' AND '{end_date_str}'
+    cs.p_event_time BETWEEN {start_date_str} AND {end_date_str}
 GROUP BY
     event_day,
     time_{time_window}_minute,

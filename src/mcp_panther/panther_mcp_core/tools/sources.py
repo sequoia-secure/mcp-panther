@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import Field
 from typing_extensions import Annotated
 
-from ..client import _execute_query, get_rest_client
+from ..client import _execute_query, encode_path_segment, get_rest_client
 from ..permissions import Permission, all_perms
 from ..queries import GET_SOURCES_QUERY
 from .registry import mcp_tool
@@ -141,6 +141,7 @@ async def get_http_log_source(
     source_id: Annotated[
         str,
         Field(
+            min_length=1,
             description="The ID of the HTTP log source to fetch",
             examples=["http-source-123", "webhook-collector-456"],
         ),
@@ -179,7 +180,7 @@ async def get_http_log_source(
         # Execute the REST API call
         async with get_rest_client() as client:
             response_data, status_code = await client.get(
-                f"/log-sources/http/{source_id}"
+                f"/log-sources/http/{encode_path_segment(source_id)}"
             )
 
         logger.info(f"Successfully retrieved HTTP log source: {source_id}")

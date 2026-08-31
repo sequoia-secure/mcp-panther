@@ -7,7 +7,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from ..client import get_rest_client
+from ..client import encode_path_segment, get_rest_client
 from ..permissions import Permission, all_perms
 from .registry import mcp_tool
 
@@ -120,6 +120,7 @@ async def get_global_helper(
     helper_id: Annotated[
         str,
         Field(
+            min_length=1,
             description="The ID of the global helper to fetch",
             examples=["MyGlobalHelper", "AWSUtilities", "CrowdStrikeHelpers"],
         ),
@@ -135,7 +136,7 @@ async def get_global_helper(
         async with get_rest_client() as client:
             # Allow 404 as a valid response to handle not found case
             result, status = await client.get(
-                f"/globals/{helper_id}", expected_codes=[200, 404]
+                f"/globals/{encode_path_segment(helper_id)}", expected_codes=[200, 404]
             )
 
             if status == 404:

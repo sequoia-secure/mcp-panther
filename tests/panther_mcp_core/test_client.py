@@ -235,7 +235,12 @@ def test_encode_path_segment(value, expected):
     ],
 )
 def test_encode_path_segment_rejects_traversal(value):
-    """Empty IDs, path separators and relative references are rejected."""
+    """Empty IDs, path separators and relative references are rejected.
+
+    The '%2e' cases pin an ordering invariant: the dot-segment check has to run
+    on the raw value. Quoting first would turn '%2e' into '%252e', which no
+    longer matches the pattern, silently disabling half of it.
+    """
     with pytest.raises(ValueError):
         encode_path_segment(value)
 

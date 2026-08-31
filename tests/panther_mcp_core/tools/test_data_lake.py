@@ -1,10 +1,13 @@
+import time
 from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError, validate_call
 
 from mcp_panther.panther_mcp_core.tools.data_lake import (
+    MAX_SQL_LENGTH,
     _cancel_data_lake_query,
+    _has_p_event_time_filter,
     _sql_string_literal,
     get_alert_event_stats,
     query_data_lake,
@@ -184,6 +187,73 @@ async def test_query_data_lake_invalid_event_time_usage(mock_execute_query):
         )
         assert result["query_id"] is None  # No query_id when validation fails
         mock_execute_query.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "sql_lower,expected",
+    [
+        ("select * from t where p_event_time >= x", True),
+        ("select * from t where a = 1 and t.p_event_time < x", True),
+        ("select * from t where a.b.c.p_event_time between x and y", True),
+        ("select * from t where (p_event_time = x and y)", True),
+        ("select p_event_time from t", False),
+        ("select * from t where other_column = p_event_time", False),
+        ("select * from t where other_column = t.p_event_time", False),
+        ("p_event_time >= x", False),  # no where/and keyword
+        ("select * from t wherep_event_time >= x", False),  # keyword not delimited
+        ("", False),
+    ],
+)
+def test_has_p_event_time_filter(sql_lower, expected):
+    """The time filter check only accepts p_event_time comparisons after WHERE/AND."""
+    assert _has_p_event_time_filter(sql_lower) is expected
+
+
+def test_has_p_event_time_filter_is_not_vulnerable_to_redos():
+    """The time filter check must run in linear time on adversarial input.
+
+    The previous pattern bridged WHERE/AND and p_event_time with a lazy `.*?`
+    followed by an ambiguous `(?:[\\w.]+\\.)?` group, which backtracked
+    super-linearly and blocked the event loop for minutes on this input.
+    """
+    payload = "and " + "a." * 100_000
+
+    start = time.perf_counter()
+    result = _has_p_event_time_filter(payload)
+    elapsed = time.perf_counter() - start
+
+    assert result is False
+    assert elapsed < 1.0, f"Time filter check took {elapsed:.3f}s on 200KB of input"
+
+
+@pytest.mark.asyncio
+@patch_execute_query(DATA_LAKE_MODULE_PATH)
+async def test_query_data_lake_rejects_oversized_query(mock_execute_query):
+    """Test that queries longer than MAX_SQL_LENGTH are rejected before validation."""
+    sql = (
+        "SELECT * FROM panther_logs.public.aws_cloudtrail WHERE p_event_time >= x -- "
+        + "a" * MAX_SQL_LENGTH
+    )
+
+    result = await query_data_lake(sql)
+
+    assert result["success"] is False
+    assert "too long" in result["message"]
+    assert result["query_id"] is None
+    mock_execute_query.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_query_data_lake_sql_length_annotation_validates():
+    """The sql annotation must bound the query length on the MCP call path too.
+
+    The test above calls the coroutine directly, which skips the schema validation
+    an MCP client goes through. This exercises the annotated constraint itself.
+    """
+    validated = validate_call(query_data_lake.__wrapped__)
+
+    with pytest.raises(ValidationError):
+        await validated(sql="a" * (MAX_SQL_LENGTH + 1))
 
 
 @pytest.mark.asyncio

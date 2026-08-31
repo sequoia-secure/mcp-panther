@@ -110,9 +110,11 @@ def _validate_alert_ids(v: list[str]) -> list[str]:
                 f"Alert ID must be a string, got {type(alert_id).__name__}"
             )
         if not _ALERT_ID_PATTERN.fullmatch(alert_id):
+            # Truncate the echoed value: a rejected ID has no length bound, and the
+            # message is returned to the caller's context.
             raise ValueError(
-                f"Invalid alert ID '{alert_id}'. Alert IDs may only contain letters, "
-                "digits, hyphens, and underscores (1-255 characters)"
+                f"Invalid alert ID '{alert_id[:64]}'. Alert IDs may only contain "
+                "letters, digits, hyphens, and underscores (1-255 characters)"
             )
         validated.append(alert_id)
     return validated

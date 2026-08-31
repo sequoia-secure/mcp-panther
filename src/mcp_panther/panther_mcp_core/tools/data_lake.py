@@ -131,6 +131,10 @@ async def get_alert_event_stats(
     if time_window not in [1, 5, 15, 30, 60]:
         raise ValueError("Time window must be 1, 5, 15, 30, or 60")
 
+    # Coerce so the value interpolated into the query below is always an integer
+    # literal, whatever equal-but-not-int type a direct caller passed.
+    time_window = int(time_window)
+
     # Re-validate the values that get interpolated into SQL below. The parameter
     # annotations already validate them for MCP callers; repeating it here keeps the
     # query safe when the coroutine is called directly.

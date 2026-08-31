@@ -1,9 +1,11 @@
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError, validate_call
 
 from mcp_panther.panther_mcp_core.tools.data_lake import (
     _cancel_data_lake_query,
+    _sql_string_literal,
     get_alert_event_stats,
     query_data_lake,
 )
@@ -395,6 +397,38 @@ async def test_get_alert_event_stats_rejects_empty_alert_ids(mock_execute_query)
         await get_alert_event_stats(alert_ids=[])
 
     mock_execute_query.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_alert_event_stats_parameter_annotations_validate():
+    """The parameter annotations must reject payloads on the MCP call path too.
+
+    The tests above call the coroutine directly, which skips the schema validation
+    an MCP client goes through. This exercises the annotated validators themselves.
+    """
+    validated = validate_call(get_alert_event_stats.__wrapped__)
+
+    with pytest.raises(ValidationError, match="Invalid alert ID"):
+        await validated(alert_ids=["x') OR p_alert_id IS NOT NULL --"])
+
+    with pytest.raises(ValidationError, match="Invalid date format"):
+        await validated(alert_ids=["alert-123"], start_date="2024-01-01' OR '1'='1")
+
+    with pytest.raises(ValidationError, match="Invalid date format"):
+        await validated(alert_ids=["alert-123"], end_date="2024-01-01'00:00:00")
+
+    with pytest.raises(ValidationError):
+        await validated(alert_ids=[])
+
+
+def test_sql_string_literal_escapes_quotes_and_backslashes():
+    """Quotes and backslashes must not be able to terminate the literal."""
+    assert _sql_string_literal("alert-123") == "'alert-123'"
+    assert _sql_string_literal("a'b") == "'a''b'"
+    # Snowflake honours backslash escapes inside string constants, so a trailing
+    # backslash would otherwise swallow the closing quote
+    assert _sql_string_literal("abc\\") == "'abc\\\\'"
+    assert _sql_string_literal("a\\'b") == "'a\\\\''b'"
 
 
 @pytest.mark.asyncio

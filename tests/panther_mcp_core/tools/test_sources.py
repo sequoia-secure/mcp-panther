@@ -172,7 +172,10 @@ async def test_get_http_log_source_success(mock_get_client):
     assert result["source"]["integrationLabel"] == "Test HTTP Source"
     assert result["source"]["logStreamType"] == "JSON"
     assert result["source"]["authMethod"] == "Bearer"
-    assert result["source"]["authBearerToken"] == "test-token-123"
+    # The bearer token must not be disclosed, only its presence
+    assert "authBearerToken" not in result["source"]
+    assert result["source"]["authSecretsConfigured"]["authBearerToken"] is True
+    assert "test-token-123" not in str(result)
 
     mock_client.get.assert_called_once_with("/log-sources/http/http-source-123")
 
@@ -201,9 +204,16 @@ async def test_get_http_log_source_with_hmac_auth(mock_get_client):
     assert result["success"] is True
     assert result["source"]["authMethod"] == "HMAC"
     assert result["source"]["authHeaderKey"] == "X-Signature"
-    assert result["source"]["authSecretValue"] == "secret-key-123"
     assert result["source"]["authHmacAlg"] == "sha256"
-    assert result["source"]["authBearerToken"] is None
+    # The shared secret must not be disclosed, only its presence
+    assert "authSecretValue" not in result["source"]
+    assert "secret-key-123" not in str(result)
+    assert result["source"]["authSecretsConfigured"] == {
+        "authBearerToken": False,
+        "authUsername": False,
+        "authPassword": False,
+        "authSecretValue": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -231,8 +241,13 @@ async def test_get_http_log_source_with_basic_auth(mock_get_client):
 
     assert result["success"] is True
     assert result["source"]["authMethod"] == "Basic"
-    assert result["source"]["authUsername"] == "testuser"
-    assert result["source"]["authPassword"] == "testpass"
+    # Neither half of the basic auth credential may be disclosed
+    assert "authUsername" not in result["source"]
+    assert "authPassword" not in result["source"]
+    assert "testuser" not in str(result)
+    assert "testpass" not in str(result)
+    assert result["source"]["authSecretsConfigured"]["authUsername"] is True
+    assert result["source"]["authSecretsConfigured"]["authPassword"] is True
 
 
 @pytest.mark.asyncio
@@ -290,3 +305,63 @@ async def test_get_http_log_source_with_json_array_stream_type(mock_get_client):
     assert (
         result["source"]["logStreamTypeOptions"]["jsonArrayEnvelopeField"] == "events"
     )
+
+
+@pytest.mark.asyncio
+@patch(f"{SOURCES_MODULE_PATH}.get_rest_client")
+async def test_get_http_log_source_redacts_all_credentials(mock_get_client):
+    """Test that no credential value is returned, including unknown fields."""
+    mock_http_source_all_auth = MOCK_HTTP_LOG_SOURCE.copy()
+    mock_http_source_all_auth.update(
+        {
+            "authBearerToken": "bearer-secret",
+            "authUsername": "basic-user",
+            "authPassword": "basic-secret",
+            "authHeaderKey": "X-Signature",
+            "authSecretValue": "hmac-secret",
+            "authHmacAlg": "sha256",
+            # A credential-bearing field the API may add in the future
+            "authFutureToken": "future-secret",
+        }
+    )
+
+    mock_client = create_mock_rest_client()
+    mock_client.get.return_value = (mock_http_source_all_auth, 200)
+    mock_get_client.return_value = mock_client
+
+    result = await get_http_log_source("http-source-all-auth")
+
+    assert result["success"] is True
+    serialized = str(result)
+    for secret in (
+        "bearer-secret",
+        "basic-user",
+        "basic-secret",
+        "hmac-secret",
+        "future-secret",
+    ):
+        assert secret not in serialized
+    assert "authFutureToken" not in result["source"]
+    # Non-credential configuration is still available
+    assert result["source"]["authHeaderKey"] == "X-Signature"
+    assert result["source"]["authHmacAlg"] == "sha256"
+    assert result["source"]["authSecretsConfigured"] == {
+        "authBearerToken": True,
+        "authUsername": True,
+        "authPassword": True,
+        "authSecretValue": True,
+    }
+
+
+@pytest.mark.asyncio
+@patch(f"{SOURCES_MODULE_PATH}.get_rest_client")
+async def test_get_http_log_source_unexpected_response_shape(mock_get_client):
+    """Test that a non-dict API response does not leak through unredacted."""
+    mock_client = create_mock_rest_client()
+    mock_client.get.return_value = (["unexpected", "payload"], 200)
+    mock_get_client.return_value = mock_client
+
+    result = await get_http_log_source("http-source-123")
+
+    assert result["success"] is True
+    assert result["source"] == {}

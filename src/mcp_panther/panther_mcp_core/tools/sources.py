@@ -15,6 +15,58 @@ from .registry import mcp_tool
 
 logger = logging.getLogger("mcp-panther")
 
+# Fields of the /log-sources/http/{id} response that carry ingest credential
+# material. These values are never returned to the caller; only whether they
+# are configured is reported.
+_HTTP_SOURCE_SECRET_FIELDS = (
+    "authBearerToken",
+    "authUsername",
+    "authPassword",
+    "authSecretValue",
+)
+
+# Non-credential HTTP log source fields that are safe to return. This is an
+# allow list so that any future credential-bearing field added to the API
+# response is withheld by default.
+_HTTP_SOURCE_SAFE_FIELDS = (
+    "integrationId",
+    "integrationLabel",
+    "integrationType",
+    "logTypes",
+    "logStreamType",
+    "logStreamTypeOptions",
+    "authMethod",
+    "authHeaderKey",
+    "authHmacAlg",
+    "isHealthy",
+    "createdAt",
+    "createdBy",
+    "lastModified",
+    "lastEventProcessedAtTime",
+    "lastEventReceivedAtTime",
+)
+
+
+def _redact_http_log_source(source: Any) -> dict[str, Any]:
+    """Project an HTTP log source response down to its non-credential fields.
+
+    The Panther API returns the webhook's ingest credentials (bearer token,
+    basic auth username/password, HMAC shared secret) alongside the source
+    configuration. Those secrets must not reach MCP clients or LLM context, so
+    only allow-listed configuration fields are kept and each secret is reduced
+    to a boolean saying whether it is set.
+    """
+    if not isinstance(source, dict):
+        return {}
+
+    redacted = {
+        field: source[field] for field in _HTTP_SOURCE_SAFE_FIELDS if field in source
+    }
+    redacted["authSecretsConfigured"] = {
+        field: bool(source.get(field)) for field in _HTTP_SOURCE_SECRET_FIELDS
+    }
+    return redacted
+
 
 @mcp_tool(
     annotations={
@@ -153,6 +205,10 @@ async def get_http_log_source(
     This tool provides detailed configuration information for troubleshooting
     and monitoring HTTP log source integrations.
 
+    Ingest credentials are never returned. Bearer tokens, basic auth
+    usernames/passwords and HMAC shared secrets are withheld; the response only
+    reports which of them are configured.
+
     Args:
         source_id: The ID of the HTTP log source to retrieve
 
@@ -166,12 +222,12 @@ async def get_http_log_source(
             - logStreamType: Stream type (Auto, JSON, JsonArray, etc.)
             - logStreamTypeOptions: Additional stream type configuration
             - authMethod: Authentication method (None, Bearer, Basic, etc.)
-            - authBearerToken: Bearer token if using Bearer auth
-            - authUsername: Username if using Basic auth
-            - authPassword: Password if using Basic auth
             - authHeaderKey: Header key for HMAC/SharedSecret auth
-            - authSecretValue: Secret value for HMAC/SharedSecret auth
             - authHmacAlg: HMAC algorithm if using HMAC auth
+            - authSecretsConfigured: Map of credential field name to a boolean
+              saying whether that credential is set (authBearerToken,
+              authUsername, authPassword, authSecretValue). The credential
+              values themselves are not included.
         - message: Error message if unsuccessful
     """
     logger.info(f"Fetching HTTP log source: {source_id}")
@@ -185,10 +241,10 @@ async def get_http_log_source(
 
         logger.info(f"Successfully retrieved HTTP log source: {source_id}")
 
-        # Format the response
+        # Format the response, withholding the source's ingest credentials
         return {
             "success": True,
-            "source": response_data,
+            "source": _redact_http_log_source(response_data),
         }
     except Exception as e:
         logger.error(f"Failed to fetch HTTP log source: {str(e)}")

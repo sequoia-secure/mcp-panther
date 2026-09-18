@@ -61,7 +61,7 @@ Panther's Model Context Protocol (MCP) server provides functionality to:
 | Tool Name | Description | Sample Prompt |
 |-----------|-------------|---------------|
 | `list_log_sources` | List log sources with optional filters (health status, log types, integration type) | "Show me all healthy S3 log sources" |
-| `get_http_log_source` | Get detailed information about a specific HTTP log source by ID | "Show me the configuration for HTTP source 'webhook-collector-123'" |
+| `get_http_log_source` | Get detailed information about a specific HTTP log source by ID. Ingest credentials (bearer tokens, basic auth usernames/passwords, HMAC shared secrets) are never returned; the response reports only which of them are configured | "Show me the configuration for HTTP source 'webhook-collector-123'" |
 
 </details>
 

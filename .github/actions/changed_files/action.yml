@@ -2,7 +2,7 @@ name: Changed Files
 description: Determine modified files
 outputs:
   all_changed_files:
-    description: 'All the changed files'
+    description: 'All the changed files, one file name per line'
     value: ${{ steps.changed_files.outputs.all_changed_files }}
 runs:
   using: composite
@@ -10,11 +10,21 @@ runs:
     - name: Retrieve changed files
       id: changed_files
       uses: tj-actions/changed-files@d6babd6899969df1a11d14c368283ea4436bca78
+      with:
+        # File names are attacker controlled on pull requests, so they are never
+        # interpolated into a shell script. They are read from the environment
+        # instead, one name per line, which makes the action's own shell escaping
+        # (safe_output) unnecessary and lossy.
+        separator: "\n"
+        safe_output: false
     - name: List affected files
       if: ${{ steps.changed_files.outputs.all_changed_files != '' }}
+      env:
+        ALL_CHANGED_FILES: ${{ steps.changed_files.outputs.all_changed_files }}
       run: |
         echo "Affected files:"
-        for file in ${{ steps.changed_files.outputs.all_changed_files }}; do
+        while IFS= read -r file; do
+          [ -n "${file}" ] || continue
           echo "- ${file}"
-        done
+        done <<< "${ALL_CHANGED_FILES}"
       shell: bash

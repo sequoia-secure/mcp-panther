@@ -57,6 +57,11 @@ def _redact_http_log_source(source: Any) -> dict[str, Any]:
     to a boolean saying whether it is set.
     """
     if not isinstance(source, dict):
+        logger.warning(
+            "Unexpected HTTP log source response shape (%s); returning no fields "
+            "rather than risk disclosing credentials",
+            type(source).__name__,
+        )
         return {}
 
     redacted = {

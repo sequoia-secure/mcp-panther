@@ -70,7 +70,18 @@ jobs:
           files=()
           while IFS= read -r file; do
             [ -n "${file}" ] || continue
-            files+=("${file}")
+            # git always C-quotes names holding a backslash, a double quote or a
+            # control character, whatever core.quotepath says. Nothing unquotes
+            # them here, so fail loudly rather than skip the file silently.
+            case "${file}" in
+              '"'*'"')
+                echo "::error::Cannot lint file with unusual name: ${file}"
+                exit 1
+                ;;
+            esac
+            # ./ prefix: a file named e.g. "--ignore" would otherwise be parsed
+            # as an option by the linter and swallow the next file name.
+            files+=("./${file}")
           done <<< "${CHANGED_FILES}"
 
           if [ ${#files[@]} -eq 0 ]; then

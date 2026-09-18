@@ -2,7 +2,7 @@ name: Changed Files
 description: Determine modified files
 outputs:
   all_changed_files:
-    description: 'All the changed files, one file name per line'
+    description: 'All the changed files, one file name per line. File names are attacker controlled on pull requests: read this through env: and quote it, never interpolate it into a run: script'
     value: ${{ steps.changed_files.outputs.all_changed_files }}
 runs:
   using: composite
@@ -17,6 +17,10 @@ runs:
         # (safe_output) unnecessary and lossy.
         separator: "\n"
         safe_output: false
+        # Without this, git C-quotes names containing a backslash, a double
+        # quote or non-ASCII bytes, and nothing downstream unquotes them, so
+        # those files would silently go unscanned.
+        quotepath: false
     - name: List affected files
       if: ${{ steps.changed_files.outputs.all_changed_files != '' }}
       env:

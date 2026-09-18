@@ -10,9 +10,11 @@ import re
 
 import pytest
 from fastmcp import Client
+from graphql import OperationType
 
+from mcp_panther.panther_mcp_core import queries
 from mcp_panther.panther_mcp_core.tools import alerts
-from src.mcp_panther.server import mcp
+from mcp_panther.server import mcp
 
 # Alert tools that change server state and must be gated like each other.
 STATE_CHANGING_ALERT_TOOLS = [
@@ -23,9 +25,28 @@ STATE_CHANGING_ALERT_TOOLS = [
     "update_alert_status",
 ]
 
-# Matches the GraphQL mutation constants defined in queries.py, e.g.
-# AI_SUMMARIZE_ALERT_MUTATION.
-_MUTATION_CONSTANT_PATTERN = re.compile(r"\b[A-Z0-9_]+_MUTATION\b")
+
+def _mutation_constants() -> set[str]:
+    """Names in queries.py whose GraphQL document is a mutation.
+
+    Derived from the parsed operation type rather than the constant name:
+    several mutations are named ``*_QUERY``, so matching on the name alone
+    would miss them.
+    """
+    names = set()
+    for name, document in vars(queries).items():
+        definitions = getattr(document, "definitions", None) or ()
+        if any(
+            getattr(definition, "operation", None) is OperationType.MUTATION
+            for definition in definitions
+        ):
+            names.add(name)
+    return names
+
+
+def _registered_name(func) -> str:
+    metadata = getattr(func, "_mcp_tool_metadata", {})
+    return metadata.get("name") or func.__name__
 
 
 async def _registered_annotations() -> dict:
@@ -61,13 +82,16 @@ async def test_start_ai_alert_triage_is_advertised_as_state_changing():
 async def test_no_alert_tool_running_a_mutation_is_read_only():
     """Sweep the alert tools: running a GraphQL mutation rules out read-only."""
     annotations_by_name = await _registered_annotations()
+    mutation_pattern = re.compile(
+        r"\b(?:%s)\b" % "|".join(sorted(_mutation_constants()))
+    )
 
     mutating_tools = []
-    for name, func in vars(alerts).items():
+    for func in vars(alerts).values():
         if not callable(func) or not hasattr(func, "_mcp_tool_metadata"):
             continue
-        if _MUTATION_CONSTANT_PATTERN.search(inspect.getsource(func)):
-            mutating_tools.append(name)
+        if mutation_pattern.search(inspect.getsource(func)):
+            mutating_tools.append(_registered_name(func))
 
     # Guards the sweep itself: if the detection stops finding anything, the test
     # would pass vacuously.
@@ -76,7 +100,6 @@ async def test_no_alert_tool_running_a_mutation_is_read_only():
     read_only = [
         name
         for name in mutating_tools
-        if annotations_by_name[name] is not None
-        and annotations_by_name[name].readOnlyHint is True
+        if getattr(annotations_by_name.get(name), "readOnlyHint", None) is True
     ]
     assert read_only == []

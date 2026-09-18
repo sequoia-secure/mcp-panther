@@ -7,6 +7,7 @@ import re
 from contextlib import asynccontextmanager
 from importlib.metadata import version
 from typing import Any, AnyStr, Dict, List, Optional, Tuple, Union
+from urllib.parse import quote
 
 import aiohttp
 from gql import Client, gql
@@ -41,6 +42,101 @@ _rest_connector: Optional[aiohttp.TCPConnector] = (
 
 class UnexpectedResponseStatusError(ValueError):
     pass
+
+
+# A path segment made up only of dots - written literally or percent-encoded -
+# is a relative path reference. aiohttp/yarl resolves those, which would move a
+# request off the endpoint its tool is authorized to call.
+_DOT_SEGMENT_PATTERN = re.compile(r"(?:\.|%2e){1,2}", re.IGNORECASE)
+
+# Percent-encoded '/' and '\'. encode_path_segment never emits these (it
+# rejects separators outright), so their presence means a caller built a path
+# by hand out of an unencoded value.
+_ENCODED_SEPARATOR_PATTERN = re.compile(r"%(?:2f|5c)", re.IGNORECASE)
+
+
+def encode_path_segment(value: str) -> str:
+    """Percent-encode an untrusted value for use as a single URL path segment.
+
+    Tool parameters are untrusted: they arrive from the MCP client and, through
+    it, from any content the model reads (alert titles, log events, detection
+    bodies). '/', '?' and '#' are structural to aiohttp/yarl, so a raw value
+    interpolated into a REST path can retarget the authenticated request at a
+    different Panther endpoint. Encoding keeps the value opaque.
+
+    Panther IDs never contain a path separator, so one is rejected rather than
+    encoded: that keeps a traversal attempt from reaching the API as a '%2F'
+    sequence at all.
+
+    Args:
+        value: The raw value (e.g. a user, role, or detection ID)
+
+    Returns:
+        str: The value encoded as exactly one path segment
+
+    Raises:
+        ValueError: If the value is empty, contains a path separator, or is a
+            relative path reference
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("ID cannot be empty")
+
+    if "/" in value or "\\" in value:
+        raise ValueError(f"Invalid ID '{value}': IDs cannot contain path separators")
+
+    # Checked before quoting: quoting would turn '%2e' into '%252e' and hide an
+    # encoded traversal attempt from the pattern.
+    if _DOT_SEGMENT_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"Invalid ID '{value}': relative path references are not valid IDs"
+        )
+
+    return quote(value, safe="")
+
+
+def validate_rest_path(path: str) -> str:
+    """Reject request paths that would resolve outside their intended endpoint.
+
+    Defense in depth behind :func:`encode_path_segment`: a caller that
+    interpolates an unencoded value into a path must not be able to point the
+    request at another endpoint via traversal sequences, an embedded query
+    string, or a fragment.
+
+    Args:
+        path: The API path (e.g., '/rules' or '/rules/{rule_id}')
+
+    Returns:
+        str: The path, unchanged, if it is safe to use
+
+    Raises:
+        ValueError: If the path could retarget the request
+    """
+    if "?" in path or "#" in path:
+        raise ValueError(
+            f"Invalid API path '{path}': query strings and fragments must be "
+            f"passed via the 'params' argument"
+        )
+
+    if "\\" in path or "://" in path or path.startswith("//"):
+        raise ValueError(
+            f"Invalid API path '{path}': paths must be relative to the API base URL"
+        )
+
+    # An encoded separator can only come from a caller that skipped
+    # encode_path_segment; no Panther endpoint needs one, and letting it reach
+    # the API risks the server decoding it back into a traversal.
+    if _ENCODED_SEPARATOR_PATTERN.search(path):
+        raise ValueError(
+            f"Invalid API path '{path}': encoded path separators are not allowed"
+        )
+
+    for segment in path.split("/"):
+        if _DOT_SEGMENT_PATTERN.fullmatch(segment):
+            raise ValueError(
+                f"Invalid API path '{path}': relative path references are not allowed"
+            )
+
+    return path
 
 
 async def get_json_from_script_tag(
@@ -512,7 +608,13 @@ class PantherRestClient:
 
         Returns:
             str: The complete URL with base URL and path
+
+        Raises:
+            ValueError: If the path could retarget the request at a different
+                endpoint (see :func:`validate_rest_path`)
         """
+        path = validate_rest_path(path)
+
         # Remove leading slash if present to avoid double slashes
         if path.startswith("/"):
             path = path[1:]

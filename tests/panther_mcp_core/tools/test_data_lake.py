@@ -1,11 +1,16 @@
+import time
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError, validate_call
 
 from mcp_panther.panther_mcp_core.tools.data_lake import (
+    MAX_SQL_LENGTH,
     _cancel_data_lake_query,
+    _has_p_event_time_filter,
+    _sql_string_literal,
+    get_alert_event_stats,
     query_data_lake,
-    wrap_reserved_words,
 )
 from tests.utils.helpers import patch_execute_query
 
@@ -184,6 +189,73 @@ async def test_query_data_lake_invalid_event_time_usage(mock_execute_query):
         mock_execute_query.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "sql_lower,expected",
+    [
+        ("select * from t where p_event_time >= x", True),
+        ("select * from t where a = 1 and t.p_event_time < x", True),
+        ("select * from t where a.b.c.p_event_time between x and y", True),
+        ("select * from t where (p_event_time = x and y)", True),
+        ("select p_event_time from t", False),
+        ("select * from t where other_column = p_event_time", False),
+        ("select * from t where other_column = t.p_event_time", False),
+        ("p_event_time >= x", False),  # no where/and keyword
+        ("select * from t wherep_event_time >= x", False),  # keyword not delimited
+        ("", False),
+    ],
+)
+def test_has_p_event_time_filter(sql_lower, expected):
+    """The time filter check only accepts p_event_time comparisons after WHERE/AND."""
+    assert _has_p_event_time_filter(sql_lower) is expected
+
+
+def test_has_p_event_time_filter_is_not_vulnerable_to_redos():
+    """The time filter check must run in linear time on adversarial input.
+
+    The previous pattern bridged WHERE/AND and p_event_time with a lazy `.*?`
+    followed by an ambiguous `(?:[\\w.]+\\.)?` group, which backtracked
+    super-linearly and blocked the event loop for minutes on this input.
+    """
+    payload = "and " + "a." * 100_000
+
+    start = time.perf_counter()
+    result = _has_p_event_time_filter(payload)
+    elapsed = time.perf_counter() - start
+
+    assert result is False
+    assert elapsed < 1.0, f"Time filter check took {elapsed:.3f}s on 200KB of input"
+
+
+@pytest.mark.asyncio
+@patch_execute_query(DATA_LAKE_MODULE_PATH)
+async def test_query_data_lake_rejects_oversized_query(mock_execute_query):
+    """Test that queries longer than MAX_SQL_LENGTH are rejected before validation."""
+    sql = (
+        "SELECT * FROM panther_logs.public.aws_cloudtrail WHERE p_event_time >= x -- "
+        + "a" * MAX_SQL_LENGTH
+    )
+
+    result = await query_data_lake(sql)
+
+    assert result["success"] is False
+    assert "too long" in result["message"]
+    assert result["query_id"] is None
+    mock_execute_query.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_query_data_lake_sql_length_annotation_validates():
+    """The sql annotation must bound the query length on the MCP call path too.
+
+    The test above calls the coroutine directly, which skips the schema validation
+    an MCP client goes through. This exercises the annotated constraint itself.
+    """
+    validated = validate_call(query_data_lake.__wrapped__)
+
+    with pytest.raises(ValidationError):
+        await validated(sql="a" * (MAX_SQL_LENGTH + 1))
+
+
 @pytest.mark.asyncio
 @patch_execute_query(DATA_LAKE_MODULE_PATH)
 async def test_cancel_data_lake_query_success(mock_execute_query):
@@ -253,84 +325,24 @@ async def test_cancel_data_lake_query_no_id_returned(mock_execute_query):
     assert "No query ID returned" in result["message"]
 
 
-# Reserved Words Tests
-
-
-def test_wrap_reserved_words_basic():
-    """Test basic reserved word wrapping."""
-    test_cases = [
-        {
-            "input": "SELECT eventName as 'select', awsRegion as 'from' FROM aws_cloudtrail",
-            "expected": 'SELECT eventName as "select", awsRegion as "from" FROM aws_cloudtrail',
-        },
-        {
-            "input": "SELECT 'table', 'column', 'index' FROM aws_cloudtrail",
-            "expected": 'SELECT "table", "column", "index" FROM aws_cloudtrail',
-        },
-        {
-            "input": "SELECT eventName FROM aws_cloudtrail WHERE 'where' > 100",
-            "expected": 'SELECT eventName FROM aws_cloudtrail WHERE "where" > 100',
-        },
-    ]
-
-    for case in test_cases:
-        result = wrap_reserved_words(case["input"])
-        assert result == case["expected"], (
-            f"Expected '{case['expected']}' but got '{result}'"
-        )
-
-
-def test_wrap_reserved_words_preserves_non_reserved():
-    """Test that non-reserved words are not modified."""
-    sql = "SELECT eventName FROM aws_cloudtrail WHERE eventTime > '2024-01-01'"
-    result = wrap_reserved_words(sql)
-
-    # Should not quote non-reserved words
-    assert '"2024-01-01"' not in result
-    assert "'2024-01-01'" in result
-
-
-def test_wrap_reserved_words_complex_query():
-    """Test reserved words in complex queries."""
-    sql = """
-    SELECT eventName as 'select', awsRegion as 'from'
-    FROM aws_cloudtrail 
-    WHERE p_event_time >= CURRENT_TIMESTAMP() - INTERVAL '1 DAY'
-    ORDER BY 'select', 'from'
-    """
-
-    expected = """
-    SELECT eventName as "select", awsRegion as "from"
-    FROM aws_cloudtrail 
-    WHERE p_event_time >= CURRENT_TIMESTAMP() - INTERVAL '1 DAY'
-    ORDER BY "select", "from"
-    """
-
-    result = wrap_reserved_words(sql)
-    assert result == expected
-
-
-def test_wrap_reserved_words_handles_errors():
-    """Test that function handles malformed SQL gracefully."""
-    malformed_sql = "SELECT FROM WHERE ((("
-    result = wrap_reserved_words(malformed_sql)
-    # Should return original SQL if parsing fails
-    assert result == malformed_sql
+# SQL Literal Handling Tests
 
 
 @pytest.mark.asyncio
 @patch_execute_query(DATA_LAKE_MODULE_PATH)
-async def test_query_data_lake_with_reserved_words_processing(
+async def test_query_data_lake_preserves_string_literals(
     mock_execute_query,
 ):
-    """Test that query_data_lake processes reserved words."""
+    """String literals must reach the data lake unchanged, reserved words included."""
     mock_execute_query.return_value = {"executeDataLakeQuery": {"id": MOCK_QUERY_ID}}
 
-    # SQL with single-quoted reserved words that should be converted to double-quoted
-    input_sql = "SELECT eventName as 'select', awsRegion as 'from' FROM panther_logs.public.aws_cloudtrail WHERE p_event_time >= DATEADD(day, -30, CURRENT_TIMESTAMP()) LIMIT 10"
-    expected_processed_sql = 'SELECT eventName as "select", awsRegion as "from" FROM panther_logs.public.aws_cloudtrail WHERE p_event_time >= DATEADD(day, -30, CURRENT_TIMESTAMP()) LIMIT 10'
+    # 'select' and 'union' are data here, and must not be rewritten as identifiers
+    input_sql = (
+        "SELECT eventName FROM panther_logs.public.aws_cloudtrail "
+        "WHERE p_event_time >= DATEADD(day, -30, CURRENT_TIMESTAMP()) "
+        "AND eventName IN ('select', 'union') LIMIT 10"
+    )
 
-    # Mock the query results function to return success
     with patch(f"{DATA_LAKE_MODULE_PATH}._get_data_lake_query_results") as mock_results:
         mock_results.return_value = {
             "success": True,
@@ -346,17 +358,147 @@ async def test_query_data_lake_with_reserved_words_processing(
 
         result = await query_data_lake(input_sql)
 
-    # Verify the function returns success
     assert result["success"] is True
-    assert result["status"] == "succeeded"
-    assert result["query_id"] == MOCK_QUERY_ID
 
-    # Verify the SQL was processed for reserved words
-    call_args = mock_execute_query.call_args[0][1]
-    processed_sql = call_args["input"]["sql"]
+    submitted_sql = mock_execute_query.call_args[0][1]["input"]["sql"]
+    assert submitted_sql == input_sql
+    assert '"select"' not in submitted_sql
+    assert '"union"' not in submitted_sql
 
-    # Assert the exact transformed SQL
-    assert processed_sql == expected_processed_sql
+
+# get_alert_event_stats Input Validation Tests
+
+
+@pytest.mark.asyncio
+@patch_execute_query(DATA_LAKE_MODULE_PATH)
+async def test_get_alert_event_stats_builds_quoted_query(mock_execute_query):
+    """Alert IDs and dates are emitted as quoted literals inside the generated SQL."""
+    mock_execute_query.return_value = {"executeDataLakeQuery": {"id": MOCK_QUERY_ID}}
+
+    with patch(f"{DATA_LAKE_MODULE_PATH}._get_data_lake_query_results") as mock_results:
+        mock_results.return_value = {
+            "success": True,
+            "status": "succeeded",
+            "results": [],
+            "column_info": {},
+            "stats": {},
+            "has_next_page": False,
+            "next_cursor": None,
+            "message": "Query executed successfully",
+            "query_id": MOCK_QUERY_ID,
+        }
+
+        result = await get_alert_event_stats(
+            alert_ids=["alert-123", "df1eb66cede030f1a6d29362ba437178"],
+            start_date="2024-03-20T00:00:00Z",
+            end_date="2024-03-21T00:00:00Z",
+        )
+
+    assert result["success"] is True
+
+    submitted_sql = mock_execute_query.call_args[0][1]["input"]["sql"]
+    assert (
+        "cs.p_alert_id IN ('alert-123', 'df1eb66cede030f1a6d29362ba437178')"
+        in submitted_sql
+    )
+    assert (
+        "cs.p_event_time BETWEEN '2024-03-20T00:00:00Z' AND '2024-03-21T00:00:00Z'"
+        in submitted_sql
+    )
+
+
+@pytest.mark.asyncio
+@patch_execute_query(DATA_LAKE_MODULE_PATH)
+async def test_get_alert_event_stats_rejects_injected_alert_ids(mock_execute_query):
+    """Alert IDs that could alter query grammar are rejected before any query runs."""
+    malicious_ids = [
+        "x') OR p_alert_id IS NOT NULL UNION SELECT 1 --",
+        "abc' OR '1'='1",
+        "abc123; DROP TABLE foo",
+        "abc 123",
+        'abc"123',
+        "abc\\123",
+        "",
+    ]
+
+    for malicious_id in malicious_ids:
+        with pytest.raises(ValueError, match="Invalid alert ID"):
+            await get_alert_event_stats(alert_ids=[malicious_id])
+
+    mock_execute_query.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch_execute_query(DATA_LAKE_MODULE_PATH)
+async def test_get_alert_event_stats_rejects_injected_dates(mock_execute_query):
+    """Date parameters must be valid ISO-8601 before being placed in the query."""
+    malicious_dates = [
+        "2024-01-01' OR '1'='1",
+        "2024-01-01' UNION SELECT * FROM panther_logs.public.aws_cloudtrail --",
+        "not-a-date",
+        # datetime.fromisoformat() accepts any single character as the date/time
+        # separator, so these parse as ISO-8601 but carry SQL metacharacters
+        "2024-01-01'00:00:00",
+        '2024-01-01"00:00:00',
+        "2024-01-01\\00:00:00",
+        "2024-01-01;00:00:00",
+        "2024-01-01\n00:00:00",
+    ]
+
+    for malicious_date in malicious_dates:
+        with pytest.raises(ValueError, match="Invalid date format"):
+            await get_alert_event_stats(
+                alert_ids=["alert-123"], start_date=malicious_date
+            )
+
+        with pytest.raises(ValueError, match="Invalid date format"):
+            await get_alert_event_stats(
+                alert_ids=["alert-123"], end_date=malicious_date
+            )
+
+    mock_execute_query.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch_execute_query(DATA_LAKE_MODULE_PATH)
+async def test_get_alert_event_stats_rejects_empty_alert_ids(mock_execute_query):
+    """An empty alert ID list would otherwise produce a malformed IN () clause."""
+    with pytest.raises(ValueError, match="At least one alert ID"):
+        await get_alert_event_stats(alert_ids=[])
+
+    mock_execute_query.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_alert_event_stats_parameter_annotations_validate():
+    """The parameter annotations must reject payloads on the MCP call path too.
+
+    The tests above call the coroutine directly, which skips the schema validation
+    an MCP client goes through. This exercises the annotated validators themselves.
+    """
+    validated = validate_call(get_alert_event_stats.__wrapped__)
+
+    with pytest.raises(ValidationError, match="Invalid alert ID"):
+        await validated(alert_ids=["x') OR p_alert_id IS NOT NULL --"])
+
+    with pytest.raises(ValidationError, match="Invalid date format"):
+        await validated(alert_ids=["alert-123"], start_date="2024-01-01' OR '1'='1")
+
+    with pytest.raises(ValidationError, match="Invalid date format"):
+        await validated(alert_ids=["alert-123"], end_date="2024-01-01'00:00:00")
+
+    with pytest.raises(ValidationError):
+        await validated(alert_ids=[])
+
+
+def test_sql_string_literal_escapes_quotes_and_backslashes():
+    """Quotes and backslashes must not be able to terminate the literal."""
+    assert _sql_string_literal("alert-123") == "'alert-123'"
+    assert _sql_string_literal("a'b") == "'a''b'"
+    # Snowflake honours backslash escapes inside string constants, so a trailing
+    # backslash would otherwise swallow the closing quote
+    assert _sql_string_literal("abc\\") == "'abc\\\\'"
+    assert _sql_string_literal("a\\'b") == "'a\\\\''b'"
 
 
 @pytest.mark.asyncio

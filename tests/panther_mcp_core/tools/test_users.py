@@ -1,5 +1,6 @@
 import pytest
 
+from mcp_panther.panther_mcp_core.client import validate_rest_path
 from mcp_panther.panther_mcp_core.tools.users import (
     get_user,
     list_users,
@@ -96,3 +97,39 @@ async def test_list_users_structure():
     assert "limit" in params
     assert sig.parameters["cursor"].default is None
     assert sig.parameters["limit"].default == 60
+
+
+# (injected id, expected path or None when the id must be rejected outright)
+PATH_INJECTION_CASES = [
+    ("../api-tokens/self", None),
+    ("user-123/../../api-tokens/self", None),
+    ("..", None),
+    ("%2e%2e", None),
+    ("..%2fapi-tokens", "/users/..%252fapi-tokens"),
+    ("user-123?limit=1#", "/users/user-123%3Flimit%3D1%23"),
+    ("a\r\nX-Injected: 1", "/users/a%0D%0AX-Injected%3A%201"),
+]
+
+
+@pytest.mark.asyncio
+@patch_rest_client(USERS_MODULE_PATH)
+async def test_get_user_rejects_path_injection(mock_rest_client):
+    """An injected ID cannot retarget the request at another REST endpoint."""
+    for malicious_id, expected_path in PATH_INJECTION_CASES:
+        mock_rest_client.get.reset_mock()
+        mock_rest_client.get.return_value = (MOCK_USER, 200)
+
+        result = await get_user(malicious_id)
+
+        if expected_path is None:
+            # Rejected outright: no request is issued at all.
+            assert not mock_rest_client.get.called, malicious_id
+            assert result["success"] is False, malicious_id
+            continue
+
+        # Otherwise the ID survives only as one opaque segment under /users,
+        # and the path the client would build is still accepted by the
+        # client-side validator.
+        path = mock_rest_client.get.call_args[0][0]
+        assert path == expected_path, malicious_id
+        assert validate_rest_path(path) == expected_path

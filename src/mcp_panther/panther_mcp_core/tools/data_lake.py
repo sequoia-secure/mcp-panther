@@ -9,8 +9,7 @@ import time
 from enum import Enum
 from typing import Annotated, Any, Dict, List
 
-import sqlparse
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from ..client import _execute_query, _get_today_date_range
 from ..permissions import Permission, all_perms
@@ -22,6 +21,7 @@ from ..queries import (
     LIST_DATABASES_QUERY,
     LIST_TABLES_QUERY,
 )
+from ..validators import _validate_alert_ids, _validate_iso_date
 from .registry import mcp_tool
 
 logger = logging.getLogger("mcp-panther")
@@ -29,105 +29,81 @@ logger = logging.getLogger("mcp-panther")
 INITIAL_QUERY_SLEEP_SECONDS = 1
 MAX_QUERY_SLEEP_SECONDS = 5
 
+# Upper bound on the SQL we are willing to validate and forward. Real queries
+# are orders of magnitude smaller; the cap keeps the work done on untrusted
+# input bounded before the validation scans below run over it.
+MAX_SQL_LENGTH = 100_000
 
-# Snowflake reserved words that should be quoted when used as identifiers
-SNOWFLAKE_RESERVED_WORDS = {
-    "SELECT",
-    "FROM",
-    "WHERE",
-    "JOIN",
-    "LEFT",
-    "RIGHT",
-    "INNER",
-    "OUTER",
-    "ON",
-    "AS",
-    "ORDER",
-    "GROUP",
-    "BY",
-    "HAVING",
-    "UNION",
-    "ALL",
-    "DISTINCT",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "CREATE",
-    "ALTER",
-    "DROP",
-    "TABLE",
-    "VIEW",
-    "INDEX",
-    "COLUMN",
-    "PRIMARY",
-    "KEY",
-    "FOREIGN",
-    "UNIQUE",
-    "NOT",
-    "NULL",
-    "DEFAULT",
-    "CHECK",
-    "CONSTRAINT",
-    "REFERENCES",
-    "CASCADE",
-    "RESTRICT",
-    "SET",
-    "VALUES",
-    "INTO",
-    "CASE",
-    "WHEN",
-    "THEN",
-    "ELSE",
-    "END",
-    "IF",
-    "EXISTS",
-    "LIKE",
-    "BETWEEN",
-    "IN",
-    "IS",
-    "AND",
-    "OR",
-    "WITH",
-}
+# Time filter validation patterns, compiled once at import time.
+#
+# These patterns deliberately avoid overlapping/nested quantifiers so that
+# matching stays linear in the length of the query. The previous single pattern
+# bridged `WHERE`/`AND` and `p_event_time` with a lazy `.*?` followed by an
+# optional `(?:[\w.]+\.)?` qualifier; the two quantifiers matched the same
+# characters, so non-matching input caused super-linear backtracking (ReDoS)
+# that blocked the server's event loop.
+#
+# The equivalent check is split in two linear steps instead: find the first
+# `WHERE`/`AND` keyword, then look for a `p_event_time` comparison after it. Any
+# table qualifier (e.g. `t.p_event_time`) is simply part of the text skipped
+# between the two, exactly as the lazy bridge allowed.
+_WHERE_OR_AND_PATTERN = re.compile(r"\b(?:where|and)\s")
+_P_EVENT_TIME_FILTER_PATTERN = re.compile(r"p_event_time\s*(?:>=|<=|=|>|<|between)")
+_PANTHER_MACRO_PATTERN = re.compile(
+    r"p_occurs_(?:since|between|around|after|before)\s*\("
+)
+_PANTHER_DATABASE_PATTERN = re.compile(
+    r"\Wpanther_(?:views|signals|rule_matches|rule_errors|monitor|logs|cloudsecurity)\."
+)
 
 
-def wrap_reserved_words(sql: str) -> str:
+def _has_p_event_time_filter(sql_lower: str) -> bool:
     """
-    Simple function to wrap reserved words in SQL using sqlparse.
-
-    This function:
-    1. Parses the SQL using sqlparse
-    2. Identifies string literals that match reserved words
-    3. Converts single-quoted reserved words to double-quoted ones
+    Check for a `p_event_time` comparison in a filter position.
 
     Args:
-        sql: The SQL query string to process
+        sql_lower: The lowercased query, with newlines already collapsed.
 
     Returns:
-        The SQL with reserved words properly quoted
+        True if a `p_event_time` comparison appears after a `WHERE`/`AND`
+        keyword, optionally table-qualified.
     """
-    try:
-        # Parse the SQL
-        parsed = sqlparse.parse(sql)[0]
+    # The first WHERE/AND gives the earliest position a filter can start at, so
+    # searching from it is equivalent to trying every WHERE/AND keyword.
+    where_or_and = _WHERE_OR_AND_PATTERN.search(sql_lower)
+    if where_or_and is None:
+        return False
 
-        # Convert the parsed SQL back to string, but process tokens
-        result = []
-        for token in parsed.flatten():
-            if token.ttype is sqlparse.tokens.Literal.String.Single:
-                # Remove quotes and check if it's a reserved word
-                value = token.value.strip("'")
-                if value.upper() in SNOWFLAKE_RESERVED_WORDS:
-                    # Convert to double-quoted identifier
-                    result.append(f'"{value}"')
-                else:
-                    result.append(token.value)
-            else:
-                result.append(token.value)
+    match = _P_EVENT_TIME_FILTER_PATTERN.search(sql_lower, where_or_and.end())
+    return match is not None
 
-        return "".join(result)
-    except Exception as e:
-        logger.warning(f"Failed to parse SQL for reserved words: {e}")
-        return sql
+
+# Characters an ISO-8601 timestamp can legitimately contain. datetime.fromisoformat()
+# accepts any single character as the date/time separator (e.g. "2024-01-01'00:00:00"),
+# so dates are additionally checked against this set before reaching a SQL literal.
+_SQL_DATE_CHARS = re.compile(r"[0-9A-Za-z:+. -]+")
+
+
+def _sql_string_literal(value: str) -> str:
+    """Render a value as a single-quoted Snowflake SQL string literal.
+
+    Callers must still validate the value against the format they expect; the
+    escaping here is defense in depth so a stray quote or backslash can never
+    terminate the literal and turn data into query structure.
+    """
+    escaped = value.replace("\\", "\\\\").replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _validate_sql_date(value: str | None) -> str | None:
+    """Validate a date that will be interpolated into a SQL string literal."""
+    value = _validate_iso_date(value)
+    if value is not None and not _SQL_DATE_CHARS.fullmatch(value):
+        raise ValueError(
+            f"Invalid date format '{value}'. Must be in ISO-8601 format "
+            "(e.g., '2024-03-20T00:00:00Z')"
+        )
+    return value
 
 
 class QueryStatus(str, Enum):
@@ -148,9 +124,11 @@ class QueryStatus(str, Enum):
 async def get_alert_event_stats(
     alert_ids: Annotated[
         List[str],
+        BeforeValidator(_validate_alert_ids),
         Field(
             description="List of alert IDs to analyze",
             examples=[["alert-123", "alert-456", "alert-789"]],
+            min_length=1,
         ),
     ],
     time_window: Annotated[
@@ -164,6 +142,7 @@ async def get_alert_event_stats(
     ] = 30,
     start_date: Annotated[
         str | None,
+        BeforeValidator(_validate_sql_date),
         Field(
             description="Optional start date in ISO-8601 format. Defaults to start of today UTC.",
             examples=["2024-03-20T00:00:00Z"],
@@ -171,6 +150,7 @@ async def get_alert_event_stats(
     ] = None,
     end_date: Annotated[
         str | None,
+        BeforeValidator(_validate_sql_date),
         Field(
             description="Optional end date in ISO-8601 format. Defaults to end of today UTC.",
             examples=["2024-03-20T00:00:00Z"],
@@ -199,18 +179,32 @@ async def get_alert_event_stats(
     if time_window not in [1, 5, 15, 30, 60]:
         raise ValueError("Time window must be 1, 5, 15, 30, or 60")
 
+    # Coerce so the value interpolated into the query below is always an integer
+    # literal, whatever equal-but-not-int type a direct caller passed.
+    time_window = int(time_window)
+
+    # Re-validate the values that get interpolated into SQL below. The parameter
+    # annotations already validate them for MCP callers; repeating it here keeps the
+    # query safe when the coroutine is called directly.
+    alert_ids = _validate_alert_ids(alert_ids)
+    if not alert_ids:
+        raise ValueError("At least one alert ID must be provided")
+
+    start_date = _validate_sql_date(start_date)
+    end_date = _validate_sql_date(end_date)
+
     # Get default date range if not provided
     if not start_date or not end_date:
         default_start, default_end = _get_today_date_range()
         start_date = start_date or default_start
         end_date = end_date or default_end
 
-    # Convert alert IDs list to SQL array
-    alert_ids_str = ", ".join(f"'{aid}'" for aid in alert_ids)
+    # Convert alert IDs list to a SQL list of quoted literals
+    alert_ids_str = ", ".join(_sql_string_literal(aid) for aid in alert_ids)
 
-    # Use the date strings directly (already in GraphQL format)
-    start_date_str = start_date
-    end_date_str = end_date
+    # Quote the dates as literals (already validated as ISO-8601)
+    start_date_str = _sql_string_literal(start_date)
+    end_date_str = _sql_string_literal(end_date)
 
     query = f"""
 SELECT
@@ -233,7 +227,7 @@ FROM
 WHERE
     cs.p_alert_id IN ({alert_ids_str})
 AND 
-    cs.p_event_time BETWEEN '{start_date_str}' AND '{end_date_str}'
+    cs.p_event_time BETWEEN {start_date_str} AND {end_date_str}
 GROUP BY
     event_day,
     time_{time_window}_minute,
@@ -262,7 +256,8 @@ async def query_data_lake(
     sql: Annotated[
         str,
         Field(
-            description="The SQL query to execute. Must include a p_event_time filter condition after WHERE or AND. The query must be compatible with Snowflake SQL."
+            description="The SQL query to execute. Must include a p_event_time filter condition after WHERE or AND. The query must be compatible with Snowflake SQL.",
+            max_length=MAX_SQL_LENGTH,
         ),
     ],
     database_name: str = "panther_logs.public",
@@ -328,6 +323,8 @@ async def query_data_lake(
     - Access nested JSON: column:field.subfield
     - Quote special characters: column:"field name" or p_enrichment:"context.ip_address"
     - Array searches: ARRAY_CONTAINS('value'::VARIANT, array_column)
+    - Single quotes are always string literals; use double quotes for identifiers and
+      aliases that collide with reserved words: SELECT eventName AS "select"
 
     Returns:
         Dict with query results:
@@ -344,21 +341,26 @@ async def query_data_lake(
 
     start_time = time.time()
 
+    # Reject oversized queries before doing any validation work
+    if len(sql) > MAX_SQL_LENGTH:
+        error_msg = (
+            f"Query is too long ({len(sql)} characters). "
+            f"The maximum supported length is {MAX_SQL_LENGTH} characters."
+        )
+        logger.error(error_msg)
+        return {
+            "success": False,
+            "message": error_msg,
+            "query_id": None,
+        }
+
     # Validate that the query includes a time filter (p_event_time or Panther macros)
     sql_lower = sql.lower().replace("\n", " ")
-    has_p_event_time = re.search(
-        r"\b(where|and)\s+.*?(?:[\w.]+\.)?p_event_time\s*(>=|<=|=|>|<|between)",
-        sql_lower,
-    )
-    has_panther_macros = re.search(
-        r"p_occurs_(since|between|around|after|before)\s*\(",
-        sql_lower,
-    )
+    has_p_event_time = _has_p_event_time_filter(sql_lower)
+    has_panther_macros = _PANTHER_MACRO_PATTERN.search(sql_lower)
+    has_time_filter = has_p_event_time or has_panther_macros
 
-    if (not (has_p_event_time or has_panther_macros)) and re.search(
-        r"\Wpanther_(views|signals|rule_matches|rule_errors|monitor|logs|cloudsecurity)\.",
-        sql_lower,
-    ):
+    if not has_time_filter and _PANTHER_DATABASE_PATTERN.search(sql_lower):
         error_msg = "Query must include a time filter: either `p_event_time` condition or Panther macro (p_occurs_since, p_occurs_between, etc.)"
         logger.error(error_msg)
         return {
@@ -368,13 +370,13 @@ async def query_data_lake(
         }
 
     try:
-        # Process reserved words in the SQL
-        processed_sql = wrap_reserved_words(sql)
-        logger.debug(f"Original SQL: {sql}")
-        logger.debug(f"Processed SQL: {processed_sql}")
+        # The SQL is sent verbatim: rewriting tokens here (for example promoting a
+        # quoted literal to an identifier) would change the meaning of the caller's
+        # query and could turn data into query structure.
+        logger.debug(f"SQL: {sql}")
 
         # Prepare input variables
-        variables = {"input": {"sql": processed_sql, "databaseName": database_name}}
+        variables = {"input": {"sql": sql, "databaseName": database_name}}
 
         logger.debug(f"Query variables: {variables}")
 

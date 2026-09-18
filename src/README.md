@@ -27,7 +27,7 @@ The project includes several key dependencies:
 
 - **FastMCP**: Core MCP server framework
 - **GQL**: GraphQL client for Panther API communication
-- **SQLParse**: SQL parsing library for reserved word processing in data lake queries
+- **SQLParse**: SQL parsing library
 - **Pydantic**: Data validation and serialization
 - **Uvicorn/Starlette**: ASGI server components
 

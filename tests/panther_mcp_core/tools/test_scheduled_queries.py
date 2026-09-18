@@ -168,3 +168,21 @@ async def test_get_scheduled_query_error(mock_get_client):
     assert result["success"] is False
     assert "Failed to fetch scheduled query" in result["message"]
     assert "Not Found" in result["message"]
+
+
+@pytest.mark.asyncio
+@patch(f"{SCHEDULED_QUERIES_MODULE_PATH}.get_rest_client")
+async def test_get_scheduled_query_rejects_path_injection(mock_get_client):
+    """A non-UUID ID cannot retarget the request at another REST endpoint.
+
+    The UUID annotation only applies when FastMCP validates the call, so the
+    path itself must stay safe for a direct call too.
+    """
+    mock_client = create_mock_rest_client()
+    mock_client.get.return_value = (MOCK_QUERY_DATA, 200)
+    mock_get_client.return_value = mock_client
+
+    result = await get_scheduled_query("../api-tokens/self")
+
+    assert result["success"] is False
+    assert not mock_client.get.called

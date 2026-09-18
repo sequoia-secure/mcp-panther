@@ -8,6 +8,9 @@ multiple tool modules to ensure consistent parameter validation.
 import re
 from datetime import datetime
 
+# Alert IDs are opaque identifiers (e.g. "df1eb66cede030f1a6d29362ba437178").
+_ALERT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,255}")
+
 
 def _validate_severities(v: list[str]) -> list[str]:
     """Validate severities are valid."""
@@ -88,6 +91,33 @@ def _validate_rule_ids(v: list[str]) -> list[str]:
                 f"Invalid rule ID '{rule_id}'. Rule IDs cannot contain '@', spaces, or '#' characters"
             )
     return v
+
+
+def _validate_alert_ids(v: list[str]) -> list[str]:
+    """Validate alert IDs only contain opaque identifier characters.
+
+    Alert IDs are interpolated into data lake SQL as string literals, so they must
+    not be able to carry quotes, whitespace, or any other character that could alter
+    the grammar of the surrounding query.
+    """
+    if isinstance(v, str) or not isinstance(v, (list, tuple)):
+        raise ValueError("Alert IDs must be provided as a list of strings")
+
+    validated = []
+    for alert_id in v:
+        if not isinstance(alert_id, str):
+            raise ValueError(
+                f"Alert ID must be a string, got {type(alert_id).__name__}"
+            )
+        if not _ALERT_ID_PATTERN.fullmatch(alert_id):
+            # Truncate the echoed value: a rejected ID has no length bound, and the
+            # message is returned to the caller's context.
+            raise ValueError(
+                f"Invalid alert ID '{alert_id[:64]}'. Alert IDs may only contain "
+                "letters, digits, hyphens, and underscores (1-255 characters)"
+            )
+        validated.append(alert_id)
+    return validated
 
 
 def _validate_iso_date(v: str | None) -> str | None:

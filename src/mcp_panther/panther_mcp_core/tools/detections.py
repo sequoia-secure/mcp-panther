@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import Field
 from typing_extensions import Annotated
 
-from ..client import get_rest_client
+from ..client import encode_path_segment, get_rest_client
 from ..permissions import Permission, all_perms, any_perms
 from .registry import mcp_tool
 
@@ -64,9 +64,15 @@ def validate_detection_types(detection_types: list[str]) -> dict[str, Any] | Non
 def get_endpoint_for_detection(
     detection_type: str, detection_id: str | None = None
 ) -> str:
-    """Get the API endpoint for a detection type, optionally with an ID."""
+    """Get the API endpoint for a detection type, optionally with an ID.
+
+    The detection ID is untrusted tool input, so it is encoded as a single path
+    segment to keep the request on this endpoint.
+    """
     base_endpoint = DETECTION_TYPES[detection_type]
-    return f"{base_endpoint}/{detection_id}" if detection_id else base_endpoint
+    if not detection_id:
+        return base_endpoint
+    return f"{base_endpoint}/{encode_path_segment(detection_id)}"
 
 
 def build_detection_params(
@@ -435,6 +441,7 @@ async def get_detection(
     detection_id: Annotated[
         str,
         Field(
+            min_length=1,
             description="The ID of the detection to fetch",
             examples=["AWS.Suspicious.S3.Activity", "GCP.K8S.Privileged.Pod.Created"],
         ),
@@ -525,6 +532,7 @@ async def disable_detection(
     detection_id: Annotated[
         str,
         Field(
+            min_length=1,
             description="The ID of the detection to disable",
             examples=["AWS.Suspicious.S3.Activity", "GCP.K8S.Privileged.Pod.Created"],
         ),
@@ -547,9 +555,10 @@ async def disable_detection(
 
     # Use centralized field mapping
     field_map = SINGULAR_FIELD_MAP
-    endpoint = get_endpoint_for_detection(detection_type, detection_id)
 
     try:
+        endpoint = get_endpoint_for_detection(detection_type, detection_id)
+
         async with get_rest_client() as client:
             # First get the current detection to preserve other fields
             current_detection, status = await client.get(

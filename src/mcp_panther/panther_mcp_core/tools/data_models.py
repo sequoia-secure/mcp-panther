@@ -7,7 +7,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from ..client import get_rest_client
+from ..client import encode_path_segment, get_rest_client
 from ..permissions import Permission, all_perms
 from .registry import mcp_tool
 
@@ -97,6 +97,7 @@ async def get_data_model(
     data_model_id: Annotated[
         str,
         Field(
+            min_length=1,
             description="The ID of the data model to fetch",
             examples=["MyDataModel", "AWS_CloudTrail", "StandardUser"],
         ),
@@ -112,7 +113,8 @@ async def get_data_model(
         async with get_rest_client() as client:
             # Allow 404 as a valid response to handle not found case
             result, status = await client.get(
-                f"/data-models/{data_model_id}", expected_codes=[200, 404]
+                f"/data-models/{encode_path_segment(data_model_id)}",
+                expected_codes=[200, 404],
             )
 
             if status == 404:

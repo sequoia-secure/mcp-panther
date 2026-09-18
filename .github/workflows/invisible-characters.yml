@@ -6,9 +6,6 @@ on:
 permissions:
   contents: read
 
-env:
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
 jobs:
   changed_files:
     name: Changed Files
@@ -54,9 +51,7 @@ jobs:
     name: Detect Invisible Characters in Changed Files
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
-      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
@@ -66,7 +61,34 @@ jobs:
           python-version: '3.12'
 
       - name: Detect invisible characters
+        # The changed file names come from the pull request and are attacker
+        # controlled, so they are passed through the environment and quoted
+        # rather than interpolated into this script.
+        env:
+          CHANGED_FILES: ${{ needs.changed_files.outputs.changed_files }}
         run: |
+          files=()
+          while IFS= read -r file; do
+            [ -n "${file}" ] || continue
+            # git always C-quotes names holding a backslash, a double quote or a
+            # control character, whatever core.quotepath says. Nothing unquotes
+            # them here, so fail loudly rather than skip the file silently.
+            case "${file}" in
+              '"'*'"')
+                echo "::error::Cannot lint file with unusual name: ${file}"
+                exit 1
+                ;;
+            esac
+            # ./ prefix: a file named e.g. "--ignore" would otherwise be parsed
+            # as an option by the linter and swallow the next file name.
+            files+=("./${file}")
+          done <<< "${CHANGED_FILES}"
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No changed files eligible for invisible character linting"
+            exit 0
+          fi
+
           python .github/scripts/lint-invisible-characters/lint-invisible-characters.py \
-          ${{ needs.changed_files.outputs.changed_files }} \
+          "${files[@]}" \
           --ignore .github/scripts/lint-invisible-characters

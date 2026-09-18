@@ -948,10 +948,17 @@ async def bulk_update_alerts(
         }
 
 
+# This tool runs the aiSummarizeAlert GraphQL mutation, which creates a new AI
+# inference stream that Panther stores against the alert; get_ai_alert_triage_summary
+# then surfaces the newest stream as the alert's triage summary. That is a server-side
+# state change, so the tool must not advertise readOnlyHint: hosts that auto-approve
+# read-only tools would run it without the confirmation the other mutating alert tools
+# (update_alert_status, add_alert_comment, ...) require.
 @mcp_tool(
     annotations={
         "permissions": all_perms(Permission.RUN_PANTHER_AI),
-        "readOnlyHint": True,
+        "readOnlyHint": False,
+        "destructiveHint": True,
     }
 )
 async def start_ai_alert_triage(

@@ -210,8 +210,10 @@ Validation: Health status is clearly indicated for each source
 ```
 Prompt: "Get detailed configuration for HTTP log source [SOURCE_ID]"
 Expected Tools: get_http_log_source
-Expected Result: Complete HTTP source configuration including auth settings
-Validation: All configuration details are present and properly formatted
+Expected Result: HTTP source configuration including the auth method
+Validation: All configuration details are present and properly formatted, and no
+ingest credential value (bearer token, basic auth username/password, HMAC shared
+secret) appears in the response
 ```
 
 **Test Scenario 19: Schema Management**

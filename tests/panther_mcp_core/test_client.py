@@ -3,10 +3,14 @@ from unittest import mock
 
 import pytest
 from aiohttp import ClientResponse
+from gql import Client, gql
+from gql.transport.async_transport import AsyncTransport
+from graphql import ExecutionResult, build_schema, graphql, print_ast
 
 from mcp_panther.panther_mcp_core.client import (
     PantherRestClient,
     UnexpectedResponseStatusError,
+    _execute_query,
     _get_user_agent,
     _is_running_in_docker,
     encode_path_segment,
@@ -14,6 +18,7 @@ from mcp_panther.panther_mcp_core.client import (
     get_json_from_script_tag,
     get_panther_rest_api_base,
     get_rest_client,
+    lifespan,
     validate_rest_path,
 )
 
@@ -160,12 +165,8 @@ async def test_allow_insecure_instance_boolean_parsing(env_value, expected_ssl):
     with mock.patch.dict(os.environ, {"PANTHER_ALLOW_INSECURE_INSTANCE": env_value}):
         with mock.patch("aiohttp.ClientSession.get") as mock_get:
             mock_get.return_value.__aenter__.return_value = mock_response
-            await get_json_from_script_tag(
-                "http://example.com", "__PANTHER_CONFIG__"
-            )
-            mock_get.assert_called_once_with(
-                "http://example.com", ssl=expected_ssl
-            )
+            await get_json_from_script_tag("http://example.com", "__PANTHER_CONFIG__")
+            mock_get.assert_called_once_with("http://example.com", ssl=expected_ssl)
 
 
 @pytest.mark.asyncio
@@ -330,3 +331,88 @@ def test_build_url_rejects_traversal():
 
     with pytest.raises(ValueError):
         client._build_url("/users/../api-tokens/self")
+
+
+@pytest.mark.asyncio
+async def test_execute_query_sends_variables_without_mutating_query():
+    transport = _RecordingTransport()
+    query = gql("query Alert($id: ID!) { alert(id: $id) { id } }")
+
+    async with Client(transport=transport) as session:
+        with mock.patch(
+            "mcp_panther.panther_mcp_core.client._graphql_session", session
+        ):
+            result = await _execute_query(query, {"id": "a1"})
+
+    assert result == {"alert": {"id": "a1"}}
+    assert transport.requests[0].variable_values == {"id": "a1"}
+    assert query.variable_values is None
+
+
+@pytest.mark.asyncio
+async def test_lifespan_introspection_omits_input_value_deprecation():
+    transport = _SchemaTransport()
+
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                "PANTHER_INSTANCE_URL": "https://example.com",
+                "PANTHER_API_TOKEN": "test-token",
+            },
+        ),
+        mock.patch(
+            "mcp_panther.panther_mcp_core.client.get_panther_gql_endpoint",
+            new=mock.AsyncMock(return_value="https://example.com/public/graphql"),
+        ),
+        mock.patch(
+            "mcp_panther.panther_mcp_core.client.AIOHTTPTransport",
+            return_value=transport,
+        ),
+    ):
+        async with lifespan(None):
+            pass
+
+    introspection = transport.queries[0]
+    assert "__schema" in introspection
+    assert "args(includeDeprecated" not in introspection
+    assert "inputFields(includeDeprecated" not in introspection
+
+
+class _SchemaTransport(AsyncTransport):
+    schema = build_schema("type Query { ping: String }")
+
+    def __init__(self):
+        self.queries = []
+
+    async def connect(self):
+        pass
+
+    async def close(self):
+        pass
+
+    async def execute(self, request):
+        query = print_ast(request.document)
+        self.queries.append(query)
+        return await graphql(self.schema, query)
+
+    def subscribe(self, request):
+        raise NotImplementedError
+
+
+class _RecordingTransport(AsyncTransport):
+    def __init__(self):
+        self.requests = []
+
+    async def connect(self):
+        pass
+
+    async def close(self):
+        pass
+
+    async def execute(self, request):
+        self.requests.append(request)
+        return ExecutionResult(data={"alert": {"id": "a1"}})
+
+    def subscribe(self, request):
+        raise NotImplementedError

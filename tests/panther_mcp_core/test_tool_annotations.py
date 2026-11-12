@@ -34,13 +34,18 @@ def _mutation_constants() -> set[str]:
     would miss them.
     """
     names = set()
-    for name, document in vars(queries).items():
+    for name, request in vars(queries).items():
+        # gql 4 wraps the parsed document in a GraphQLRequest.
+        document = getattr(request, "document", request)
         definitions = getattr(document, "definitions", None) or ()
         if any(
             getattr(definition, "operation", None) is OperationType.MUTATION
             for definition in definitions
         ):
             names.add(name)
+    # An empty set would turn the sweep's pattern into one that matches every
+    # tool, so the detection failing has to be loud.
+    assert names, "no mutation documents found in queries.py"
     return names
 
 

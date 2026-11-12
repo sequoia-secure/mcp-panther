@@ -26,7 +26,7 @@ keywords = ["security", "ai", "mcp", "mcp-server", "panther"]
 dependencies = [
     # Direct deps — bumped to close CVEs in our own surface.
     "aiohttp>=3.13.4,<4.0.0",   # 18 CVE fixes in 3.11.x → 3.13.x line
-    "gql>=3.5.2,<4.0.0",
+    "gql>=4.4.0,<5.0.0",
     "click>=8.1.0,<9.0.0",
     "fastmcp>=2.14.7,<4.0.0",   # latest of the 2.14.x line; CVE-2025-69196 (MCP protocol parser)
                                 # Three further fastmcp CVEs (one CRITICAL OpenAPI provider SSRF,

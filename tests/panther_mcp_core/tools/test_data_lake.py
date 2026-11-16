@@ -1,5 +1,5 @@
 import time
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 from pydantic import ValidationError, validate_call
@@ -502,46 +502,159 @@ def test_sql_string_literal_escapes_quotes_and_backslashes():
 
 
 @pytest.mark.asyncio
-@patch_execute_query(DATA_LAKE_MODULE_PATH)
-async def test_query_data_lake_with_cursor_pagination(
-    mock_execute_query,
-):
-    """Test that query_data_lake supports cursor-based pagination."""
-    mock_execute_query.return_value = {"executeDataLakeQuery": {"id": MOCK_QUERY_ID}}
-
-    cursor = "pagination_cursor_123"
-    test_sql = (
-        "SELECT * FROM panther_logs.public.aws_cloudtrail WHERE p_occurs_since('1 d')"
-    )
-
-    # Mock the query results function to return paginated response
-    with patch(f"{DATA_LAKE_MODULE_PATH}._get_data_lake_query_results") as mock_results:
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 'null' AS sample_value",
+        "SELECT 'create' AS sample_value",
+        "SELECT 'NuLl' AS sample_value",
+        "SELECT 'ordinary text' AS sample_value",
+        "SELECT 'it''s null' AS sample_value",
+        r"SELECT 'it\'s create' AS sample_value",
+        'SELECT "create", "null", "MixedCase" FROM "sample_table"',
+        'SELECT "a""b" FROM "sample_table"',
+        "SELECT 'null' AS \"create\", 'create' AS \"null\"",
+        "SELECT $$null$$ AS sample_value",
+        "SELECT $$create 'null'; \"quoted\"\ntext$$ AS sample_value",
+        "SELECT 'null' AS sample_value -- 'create' stays a comment\n",
+        "SELECT /* 'null' */ 'create' AS sample_value;\n",
+        "SELECT 'table', 'column', 'index' FROM sample_table",
+        "SELECT sample_value FROM sample_table WHERE sample_value = 'where'",
+        "SELECT sample_value FROM sample_table WHERE event_time > '2024-01-01'",
+        "SELECT 'null' AS sample_value FROM panther_logs.public.aws_cloudtrail WHERE p_occurs_since('1 d') LIMIT 1",
+        """
+    SELECT sample_value AS "select", region AS "from"
+    FROM sample_table
+    WHERE p_event_time >= CURRENT_TIMESTAMP() - INTERVAL '1 DAY'
+    ORDER BY "select", "from"
+    """,
+    ],
+    ids=[
+        "null-literal",
+        "create-literal",
+        "mixed-case-literal",
+        "ordinary-literal",
+        "doubled-quote-literal",
+        "backslash-escaped-literal",
+        "quoted-identifiers",
+        "escaped-identifier",
+        "literals-and-identifiers",
+        "dollar-quoted-literal",
+        "multiline-dollar-quoted-literal",
+        "line-comment",
+        "block-comment",
+        "reserved-literal-projection",
+        "reserved-literal-predicate",
+        "date-literal",
+        "panther-table-with-time-macro",
+        "quoted-aliases-and-interval",
+    ],
+)
+async def test_query_data_lake_preserves_sql(sql):
+    """Submit literals and quoted identifiers to the API without rewriting SQL."""
+    with (
+        patch(f"{DATA_LAKE_MODULE_PATH}._execute_query") as mock_execute_query,
+        patch(f"{DATA_LAKE_MODULE_PATH}._get_data_lake_query_results") as mock_results,
+        patch(f"{DATA_LAKE_MODULE_PATH}.asyncio.sleep"),
+    ):
+        mock_execute_query.return_value = {
+            "executeDataLakeQuery": {"id": MOCK_QUERY_ID}
+        }
         mock_results.return_value = {
             "success": True,
             "status": "succeeded",
-            "results": [{"event": "test_data"}],
-            "results_truncated": False,
-            "total_rows_available": 1,
-            "column_info": {"order": ["event"], "types": {"event": "string"}},
-            "stats": {"bytes_scanned": 1024},
-            "has_next_page": True,
-            "next_cursor": "next_cursor_456",
+            "results": [],
+            "column_info": {},
+            "stats": {},
+            "has_next_page": False,
+            "next_cursor": None,
             "message": "Query executed successfully",
             "query_id": MOCK_QUERY_ID,
         }
 
-        result = await query_data_lake(test_sql, cursor=cursor, max_rows=50)
+        result = await query_data_lake(sql)
 
-    # Verify the function returns success with pagination info
     assert result["success"] is True
     assert result["status"] == "succeeded"
-    assert result["has_next_page"] is True
-    assert result["next_cursor"] == "next_cursor_456"
+    assert result["query_id"] == MOCK_QUERY_ID
+    mock_execute_query.assert_awaited_once()
+    variables = mock_execute_query.call_args.args[1]
+    assert variables["input"]["sql"] == sql
 
-    # Verify the cursor was passed to the results function
-    mock_results.assert_called_once_with(
-        query_id=MOCK_QUERY_ID, max_rows=50, cursor=cursor
+
+@pytest.mark.asyncio
+async def test_query_data_lake_preserves_malformed_sql_for_backend_validation():
+    """Leave SQL syntax validation to the backend and report its error."""
+    sql = "SELECT FROM WHERE ((("
+    with patch(f"{DATA_LAKE_MODULE_PATH}._execute_query") as mock_execute_query:
+        mock_execute_query.side_effect = Exception("SQL compilation error")
+        result = await query_data_lake(sql)
+
+    mock_execute_query.assert_awaited_once()
+    assert mock_execute_query.call_args.args[1]["input"]["sql"] == sql
+    assert result["success"] is False
+    assert "SQL compilation error" in result["message"]
+    assert result["query_id"] is None
+
+
+@pytest.mark.asyncio
+@patch_execute_query(DATA_LAKE_MODULE_PATH)
+async def test_query_data_lake_rejects_legacy_and_invalid_cursors(mock_execute_query):
+    """A cursor without an original query ID must not submit a new query."""
+    test_sql = (
+        "SELECT * FROM panther_logs.public.aws_cloudtrail WHERE p_occurs_since('1 d')"
     )
+    with patch(f"{DATA_LAKE_MODULE_PATH}._get_data_lake_query_results") as mock_results:
+        legacy = await query_data_lake(test_sql, cursor="old-backend-cursor")
+        invalid = await query_data_lake(
+            test_sql, cursor="mcp-panther-query-page-v1:invalid!"
+        )
+        non_ascii = await query_data_lake(
+            test_sql, cursor="mcp-panther-query-page-v1:é"
+        )
+
+    assert legacy["success"] is False
+    assert "rerun the query" in legacy["message"]
+    assert invalid["success"] is False
+    assert "Invalid pagination cursor" in invalid["message"]
+    assert non_ascii["success"] is False
+    assert "Invalid pagination cursor" in non_ascii["message"]
+    mock_execute_query.assert_not_called()
+    mock_results.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch_execute_query(DATA_LAKE_MODULE_PATH)
+async def test_query_data_lake_rejects_cursor_for_different_request(mock_execute_query):
+    """A page token cannot silently switch to different SQL or a database."""
+    mock_execute_query.return_value = {"executeDataLakeQuery": {"id": MOCK_QUERY_ID}}
+    sql = "SELECT * FROM panther_logs.public.example WHERE p_occurs_since('1 d')"
+
+    with (
+        patch(f"{DATA_LAKE_MODULE_PATH}._get_data_lake_query_results") as mock_results,
+        patch(f"{DATA_LAKE_MODULE_PATH}.asyncio.sleep"),
+    ):
+        mock_results.return_value = {
+            "success": True,
+            "status": "succeeded",
+            "has_next_page": True,
+            "next_cursor": "backend-cursor",
+            "query_id": MOCK_QUERY_ID,
+        }
+        first_page = await query_data_lake(sql)
+        wrong_sql = await query_data_lake(
+            sql + " LIMIT 1", cursor=first_page["next_cursor"]
+        )
+        wrong_database = await query_data_lake(
+            sql, database_name="other_database", cursor=first_page["next_cursor"]
+        )
+
+    assert wrong_sql["success"] is False
+    assert wrong_database["success"] is False
+    assert "does not match" in wrong_sql["message"]
+    assert "does not match" in wrong_database["message"]
+    mock_execute_query.assert_called_once()
+    mock_results.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -591,58 +704,119 @@ async def test_query_data_lake_first_page_without_cursor(
 async def test_query_data_lake_pagination_complete_workflow(
     mock_execute_query,
 ):
-    """Test complete pagination workflow from first page to last page."""
-    mock_execute_query.return_value = {"executeDataLakeQuery": {"id": MOCK_QUERY_ID}}
+    """All pages fetch from the first query instead of submitting SQL again."""
+    mock_execute_query.side_effect = [
+        {"executeDataLakeQuery": {"id": MOCK_QUERY_ID}},
+        {"executeDataLakeQuery": {"id": "unexpected-new-query"}},
+    ]
 
-    test_sql = "SELECT eventName FROM panther_logs.public.aws_cloudtrail WHERE p_occurs_since('1 d')"
+    test_sql = "SELECT eventName, 'null' AS sample_value FROM panther_logs.public.aws_cloudtrail WHERE p_occurs_since('1 d')"
 
-    # Mock first page response
-    with patch(f"{DATA_LAKE_MODULE_PATH}._get_data_lake_query_results") as mock_results:
-        # First call - no cursor, has more pages
-        mock_results.return_value = {
-            "success": True,
-            "status": "succeeded",
-            "results": [{"eventName": "GetObject"}, {"eventName": "PutObject"}],
-            "results_truncated": False,
-            "total_rows_available": 2,
-            "column_info": {"order": ["eventName"], "types": {"eventName": "string"}},
-            "stats": {"bytes_scanned": 1024},
-            "has_next_page": True,
-            "next_cursor": "page2_cursor",
-            "message": "Query executed successfully",
-            "query_id": MOCK_QUERY_ID,
-        }
-
+    with (
+        patch(f"{DATA_LAKE_MODULE_PATH}._get_data_lake_query_results") as mock_results,
+        patch(f"{DATA_LAKE_MODULE_PATH}.asyncio.sleep") as mock_sleep,
+    ):
+        mock_results.side_effect = [
+            {
+                "success": True,
+                "status": "succeeded",
+                "results": [{"eventName": "GetObject"}, {"eventName": "PutObject"}],
+                "results_truncated": False,
+                "total_rows_available": 2,
+                "column_info": {
+                    "order": ["eventName"],
+                    "types": {"eventName": "string"},
+                },
+                "stats": {"bytes_scanned": 1024},
+                "has_next_page": True,
+                "next_cursor": "page2_cursor",
+                "message": "Query executed successfully",
+                "query_id": MOCK_QUERY_ID,
+            },
+            {
+                "success": True,
+                "status": "succeeded",
+                "results": [{"eventName": "AssumeRole"}],
+                "has_next_page": True,
+                "next_cursor": "page3_cursor",
+                "query_id": MOCK_QUERY_ID,
+            },
+            {
+                "success": True,
+                "status": "succeeded",
+                "results": [{"eventName": "DeleteObject"}],
+                "has_next_page": False,
+                "next_cursor": None,
+                "query_id": MOCK_QUERY_ID,
+            },
+        ]
         first_page = await query_data_lake(test_sql, max_rows=2)
+        second_page = await query_data_lake(
+            test_sql, cursor=first_page["next_cursor"], max_rows=2
+        )
+        third_page = await query_data_lake(
+            test_sql, cursor=second_page["next_cursor"], max_rows=2
+        )
 
-        # Verify first page response
-        assert first_page["success"] is True
-        assert first_page["has_next_page"] is True
-        assert first_page["next_cursor"] == "page2_cursor"
-        assert len(first_page["results"]) == 2
+    assert first_page["next_cursor"] != "page2_cursor"
+    assert second_page["next_cursor"] != "page3_cursor"
+    assert third_page["next_cursor"] is None
+    assert [page["results"][0]["eventName"] for page in (second_page, third_page)] == [
+        "AssumeRole",
+        "DeleteObject",
+    ]
+    mock_execute_query.assert_awaited_once()
+    assert mock_execute_query.call_args.args[1]["input"]["sql"] == test_sql
+    mock_sleep.assert_awaited_once()
+    assert mock_results.call_args_list == [
+        call(query_id=MOCK_QUERY_ID, max_rows=2, cursor=None),
+        call(query_id=MOCK_QUERY_ID, max_rows=2, cursor="page2_cursor"),
+        call(query_id=MOCK_QUERY_ID, max_rows=2, cursor="page3_cursor"),
+    ]
 
-        # Mock second page response
-        mock_results.return_value = {
-            "success": True,
-            "status": "succeeded",
-            "results": [{"eventName": "AssumeRole"}],
-            "results_truncated": False,
-            "total_rows_available": 1,
-            "column_info": {"order": ["eventName"], "types": {"eventName": "string"}},
-            "stats": {"bytes_scanned": 512},
-            "has_next_page": False,
-            "next_cursor": None,
-            "message": "Query executed successfully",
-            "query_id": MOCK_QUERY_ID,
-        }
 
-        second_page = await query_data_lake(test_sql, cursor="page2_cursor", max_rows=2)
+@pytest.mark.asyncio
+@patch_execute_query(DATA_LAKE_MODULE_PATH)
+async def test_query_data_lake_continuation_failure_passes_through(mock_execute_query):
+    """Expired results pass through without another SQL submission or page token."""
+    mock_execute_query.return_value = {"executeDataLakeQuery": {"id": MOCK_QUERY_ID}}
+    sql = "SELECT 'null' AS sample_value"
+    failure = {
+        "success": False,
+        "status": "failed",
+        "message": "Query results have expired",
+        "query_id": MOCK_QUERY_ID,
+    }
 
-        # Verify second page response (last page)
-        assert second_page["success"] is True
-        assert second_page["has_next_page"] is False
-        assert second_page["next_cursor"] is None
-        assert len(second_page["results"]) == 1
+    with (
+        patch(f"{DATA_LAKE_MODULE_PATH}._get_data_lake_query_results") as mock_results,
+        patch(f"{DATA_LAKE_MODULE_PATH}.asyncio.sleep") as mock_sleep,
+    ):
+        mock_results.side_effect = [
+            {
+                "success": True,
+                "status": "succeeded",
+                "results": [{"sample_value": "null"}],
+                "has_next_page": True,
+                "next_cursor": "backend-cursor",
+                "query_id": MOCK_QUERY_ID,
+            },
+            failure,
+        ]
+        first_page = await query_data_lake(sql, max_rows=1)
+        result = await query_data_lake(
+            sql, cursor=first_page["next_cursor"], max_rows=1
+        )
+
+    assert result == failure
+    assert "next_cursor" not in result
+    mock_execute_query.assert_awaited_once()
+    assert mock_execute_query.call_args.args[1]["input"]["sql"] == sql
+    assert mock_results.await_args_list == [
+        call(query_id=MOCK_QUERY_ID, max_rows=1, cursor=None),
+        call(query_id=MOCK_QUERY_ID, max_rows=1, cursor="backend-cursor"),
+    ]
+    mock_sleep.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -757,8 +931,14 @@ async def test_query_data_lake_max_rows_parameter_limits(
             query_id=MOCK_QUERY_ID, max_rows=50, cursor=None
         )
 
-        # Test with cursor
-        await query_data_lake(test_sql, max_rows=25, cursor="test_cursor")
+        # Continue a page with a different row limit.
+        mock_results.return_value = {
+            **mock_results.return_value,
+            "has_next_page": True,
+            "next_cursor": "test_cursor",
+        }
+        first_page = await query_data_lake(test_sql)
+        await query_data_lake(test_sql, max_rows=25, cursor=first_page["next_cursor"])
         mock_results.assert_called_with(
             query_id=MOCK_QUERY_ID, max_rows=25, cursor="test_cursor"
         )
